@@ -1,0 +1,406 @@
+# Cooldown of film under zero lateral pressure, calculate potential energy and density for a specified middle volume
+#-- restart grown film,
+#   remove kinetic energy in three steps
+#   at each step change x,y box dimensions over a range
+#   calculate and report average potential energy per atom and film density at each temperature
+#   using atoms in prescribed region
+#   at bottom temp, minimum energy dump atom file
+#-- RB Stephens Nov. 2023
+print       "****************************"
+print       "Start of film cooling script"
+print       "****************************"
+
+#-- set film height
+variable   film_top equal 36.
+
+#-- set cap thickness and position
+variable   tthick    equal 3.0 #
+variable   tbot      equal 8.0 # location of the bottom of the cap
+
+#-- set film temp equal to deposition temp
+variable       film_temp equal 0.120    # <<<<<<<<<<<<DEP<<<<TEMP<<<<<<
+variable       temp_damp equal 1.0     # damps in 200*temp_damp time steps
+variable       pres_damp equal 100
+variable       film_tmp1 equal 0.15
+variable       film_tmp2 equal 0.10
+variable       film_tmp3 equal 0.03
+variable       film_tmp4 equal 0.01
+variable       film_tmp5 equal 0.003
+variable       film_tmp6 equal 0.001
+variable       film_tmp7 equal 0.0003    # final temp in cooling
+variable       cyclesteps equal 20000
+variable       datasteps equal 2000
+
+#-- ---<><><>---define input and output files with unique tag
+
+variable       infile_pfx     index "vvspn120-11"
+variable       outfile_pfx    index "Expansn-"
+variable       outres_pfx    index "res-"
+variable       restart_label  index "restart"
+variable       atom_end       index "data"
+variable       char_end       index "dump"
+variable       film_end       index ".film"
+variable       text_end       index ".txt"
+variable       instart_file   index ${infile_pfx}${restart_label}${film_end}
+variable       outatom_file   index ${outfile_pfx}${infile_pfx}${atom_end}${film_end}
+variable       outres_file    index ${outres_pfx}${infile_pfx}${text_end}
+variable       restart_file   index ${outfile_pfx}${infile_pfx}${restart_label}${film_end}
+
+#-- define system
+variable       width  equal 10
+variable       height equal 40
+
+#-- define compression range
+variable       xy_final  equal 0.99998*${width}
+
+#-- addatoms - distributed in size and interaction energy
+variable       d_width equal 0.25 # fractional width of dia and e distributions
+variable       max_dia equal 1.2
+variable       del_dia equal ${d_width}*${max_dia}
+variable       max_vol equal ${max_dia}*${max_dia}*${max_dia}/6.28
+variable       min_vol equal $(v_max_dia-v_del_dia)*$(v_max_dia-v_del_dia)*$(v_max_dia-v_del_dia)/6.28
+variable       vol_cor equal 1.4142
+variable       avg_vol equal (${max_vol}+${min_vol})/2.0
+variable       cutoff  equal ${max_dia}*2.5
+variable       max_e   equal 1.0
+variable       del_e   equal ${d_width}*${max_e}
+variable       n_typ   equal 14    # number of steps in distribution + 1 for substrate + 1 for deposit type
+
+#-- substrate atoms - one size
+variable       sub_dia equal 10.0/12.0*(${max_dia}-${del_dia})
+variable       sub_e   equal 10.0
+
+#-- define diameters and volumes for volume density calculation
+#-- sigmas for each type (a bit less than the diameter measured to lj minimum)
+variable    dia03   equal ${max_dia}
+variable    dia04   equal ${max_dia}-1.0/11.0*${del_dia}
+variable    dia05   equal ${max_dia}-2.0/11.0*${del_dia}
+variable    dia06   equal ${max_dia}-3.0/11.0*${del_dia}
+variable    dia07   equal ${max_dia}-4.0/11.0*${del_dia}
+variable    dia08   equal ${max_dia}-5.0/11.0*${del_dia}
+variable    dia09   equal ${max_dia}-6.0/11.0*${del_dia}
+variable    dia10   equal ${max_dia}-7.0/11.0*${del_dia}
+variable    dia11   equal ${max_dia}-8.0/11.0*${del_dia}
+variable    dia12   equal ${max_dia}-9.0/11.0*${del_dia}
+variable    dia13   equal ${max_dia}-10.0/11.0*${del_dia}
+variable    dia14   equal ${max_dia}-${del_dia}
+
+#-- volumes for each type (calculating to minimum in lj potential
+variable    v03    equal 3.14159/6.0*${dia03}*${dia03}*${dia03}*${vol_cor}
+variable    v04    equal 3.14159/6.0*${dia04}*${dia04}*${dia04}*${vol_cor}
+variable    v05    equal 3.14159/6.0*${dia05}*${dia05}*${dia05}*${vol_cor}
+variable    v06    equal 3.14159/6.0*${dia06}*${dia06}*${dia06}*${vol_cor}
+variable    v07    equal 3.14159/6.0*${dia07}*${dia07}*${dia07}*${vol_cor}
+variable    v08    equal 3.14159/6.0*${dia08}*${dia08}*${dia08}*${vol_cor}
+variable    v09    equal 3.14159/6.0*${dia09}*${dia09}*${dia09}*${vol_cor}
+variable    v10    equal 3.14159/6.0*${dia10}*${dia10}*${dia10}*${vol_cor}
+variable    v11    equal 3.14159/6.0*${dia11}*${dia11}*${dia11}*${vol_cor}
+variable    v12    equal 3.14159/6.0*${dia12}*${dia12}*${dia12}*${vol_cor}
+variable    v13    equal 3.14159/6.0*${dia13}*${dia13}*${dia13}*${vol_cor}
+variable    v14    equal 3.14159/6.0*${dia14}*${dia14}*${dia14}*${vol_cor}
+variable    regvol  equal ${width}*${width}   # <<<< assuming bin region height = 1
+
+#-- wall L-J potential parameters
+variable       bot_dia equal 0.75
+variable       bot_e   equal 10.0
+
+#-- substrate boundaries
+variable       sub_top equal 2.0*${sub_dia}+0.01
+variable       sub_bot equal 0.01
+
+#-- p.e. and density measuring boundaries
+variable       mob_bot equal 10.0
+variable       mob_top equal 25.0
+
+#-- define particles
+units          lj   # units dimensionless, timestep 0.005 tau_red
+                    # where tau_red = tau * sqrt(e/(m sigma^2))
+                    # for Si atoms, timestep(sec) = 0.005*1.27x10^-12 = 6 fs
+atom_style     atomic
+pair_style     lj/cut ${cutoff}
+boundary       p p f
+
+#-- input preconstructed film - this includes group definitions but not regions, variables, computes, or fix commands
+read_restart   ${instart_file}
+
+#-- start timestep at 0
+reset_timestep 0
+
+#-- add an lj floor
+fix            wall_blj all wall/lj126 zlo EDGE ${bot_e} ${bot_dia} ${cutoff} units box
+
+neigh_modify   delay 2 check yes
+
+#-- define groups by atom size
+group    at03         type 3
+group    at04         type 4
+group    at05         type 5
+group    at06         type 6
+group    at07         type 7
+group    at08         type 8
+group    at09         type 9
+group    at10         type 10
+group    at11         type 11
+group    at12         type 12
+group    at13         type 13
+group    at14         type 14
+
+#-- regions in addatoms - measured region and the floating caps (underneath and above)
+region          fcap    block 0.0 ${width} 0.0 ${width} $(v_film_top-v_tbot) $(v_film_top-v_tbot+v_tthick) side in units box
+region          ftop    block 0.0 ${width} 0.0 ${width} $(v_film_top-v_tbot+v_tthick) ${height} side in units box
+region          fmeas   block 0.0 ${width} 0.0 ${width} ${mob_bot} ${mob_top} side in units box
+
+#-- define substrate and add atom groups
+group          subatoms    type 1
+group          addatoms    subtract all subatoms
+group          fcap        region fcap
+group          ftop        region ftop
+group          mobatoms    subtract addatoms ftop fcap
+
+#-- count atoms in this film and in the measured region
+variable       flmatom_no  equal count(addatoms)
+variable       subatom_no  equal count(subatoms)
+variable       mobatom_no  equal count(mobatoms}
+
+#--compute volume density from count of each type times its volume
+
+variable nat03o equal count(at03)
+variable nat04o equal count(at04)
+variable nat05o equal count(at05)
+variable nat06o equal count(at06)
+variable nat07o equal count(at07)
+variable nat08o equal count(at08)
+variable nat09o equal count(at09)
+variable nat10o equal count(at10)
+variable nat11o equal count(at11)
+variable nat12o equal count(at12)
+variable nat13o equal count(at13)
+variable nat14o equal count(at14)
+
+variable nat03 equal count(at03,fmeas)
+variable nat04 equal count(at04,fmeas)
+variable nat05 equal count(at05,fmeas)
+variable nat06 equal count(at06,fmeas)
+variable nat07 equal count(at07,fmeas)
+variable nat08 equal count(at08,fmeas)
+variable nat09 equal count(at09,fmeas)
+variable nat10 equal count(at10,fmeas)
+variable nat11 equal count(at11,fmeas)
+variable nat12 equal count(at12,fmeas)
+variable nat13 equal count(at13,fmeas)
+variable nat14 equal count(at14,fmeas)
+
+variable svol03 equal ${nat03}*${v03}
+variable svol04 equal ${nat04}*${v04}
+variable svol05 equal ${nat05}*${v05}
+variable svol06 equal ${nat06}*${v06}
+variable svol07 equal ${nat07}*${v07}
+variable svol08 equal ${nat08}*${v08}
+
+#-- compute temperature and put it into a variable
+compute        t_mob mobatoms temp
+variable       meas_temp equal c_t_mob
+
+#-- compute per atom and total pressure
+compute        stperat mobatoms stress/atom t_mob
+compute        pr      mobatoms reduce sum c_stperat[1] c_stperat[2] c_stperat[3]
+variable       press   equal -(c_pr[1]+c_pr[2]+c_pr[3])/(3*vol)
+
+#-- compute per atom and total potential energy
+compute        peperatm mobatoms pe/atom
+compute        pt       mobatoms reduce ave c_peperatm
+variable       meas_pe  equal  c_pt
+
+#-- compute temp, kinetic and potential energy
+compute       f_temp  all temp
+variable      film_t  equal c_f_temp
+compute       ft_ke  all ke/atom
+compute       fa_ke  all reduce ave c_ft_ke
+variable      film_ke equal c_fa_ke
+compute       ft_pe  all pe/atom
+compute       fa_pe  all reduce ave c_ft_pe
+variable      film_pe equal c_fa_pe
+
+#-- compute volume fraction
+variable       volfract equal (count(at03,fmeas)*v_v03+count(at04,fmeas)*v_v04+count(at05,fmeas)*v_v05+count(at06,fmeas)*v_v06+count(at07,fmeas)*v_v07+count(at08,fmeas)*v_v08+count(at09,fmeas)*v_v09+count(at10,fmeas)*v_v10+count(at11,fmeas)*v_v11+count(at12,fmeas)*v_v12+count(at13,fmeas)*v_v13+count(at14,fmeas)*v_v14)/(v_box_width*v_box_width*(v_mob_top-v_mob_bot))
+
+#-- print temperatures, film height and atom number
+thermo_style   custom step atoms xlo xhi temp c_t_mob press v_press c_pr[1] c_pr[2] c_pr[3] v_volfract c_pt pe ke etotal
+thermo         ${datasteps}
+thermo_modify lost ignore
+
+#-- print density, pe, ... from cooldown
+print        "Cooldown film: ${infile_pfx}" file ${outres_file} screen no
+print        "Dest_Temp, Film_Temp, Box_width, avg_PE(all), avg_KE(all), avg_PE(meas),vol_fract)" append ${outres_file} screen no
+
+#-- run at deposition temp to equilibrate
+print          "*****************************************"
+print          "Starting run at initial temperature - ${film_temp} "
+print          "*****************************************"
+variable       box_width equal (xhi-xlo)
+
+fix            myprint all print ${datasteps} "${film_temp}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+
+fix            tmp_add addatoms nvt temp ${film_temp} ${film_temp} ${temp_damp}
+fix            tmp_sub subatoms nvt temp ${film_temp} ${film_temp} ${temp_damp}
+
+run            ${cyclesteps}
+
+#>>>print        "${film_temp}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file} screen no
+
+unfix          tmp_sub
+unfix          tmp_add
+unfix          myprint
+
+write_data ${outatom_file}0 nofix pair ij
+
+#-- reduce temp and deform box to keep pressure 0
+
+#-- (1) cool
+print         "*****************************************"
+print         "Starting cool 1 from ${film_temp} to ${film_tmp1} "
+print         "Maintaining P_x, P_y = 0"
+print         "*****************************************"
+fix          myprint all print ${datasteps} "${film_tmp1}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+
+fix           tmp_sub subatoms nvt temp ${film_temp} ${film_tmp1} ${temp_damp}
+fix           tmp_cap fcap     nvt temp ${film_temp} ${film_tmp1} ${temp_damp}
+fix           tmp_add addatoms npt temp ${film_temp} ${film_tmp1} ${temp_damp} x 0.0 0.0 ${pres_damp} y 0.0 0.0 ${pres_damp} couple xy dilate all
+
+run           ${cyclesteps}
+
+#>>>print        "${film_tmp1}, ${film_t}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file} screen no
+
+unfix         tmp_sub
+unfix         tmp_add
+unfix         myprint
+
+write_data ${outatom_file}1 nofix pair ij
+
+
+#-- (2) cool
+print         "*****************************************"
+print         "Starting cool 2 from ${film_tmp1} to ${film_tmp2} "
+print         "Maintaining P_x, P_y = 0"
+print         "*****************************************"
+fix          myprint all print ${datasteps} "${film_tmp2}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+fix           tmp_sub subatoms nvt temp ${film_tmp1} ${film_tmp2} ${temp_damp}
+fix           tmp_cap fcap     nvt temp ${film_tmp1} ${film_tmp2} ${temp_damp}
+fix           tmp_add addatoms npt temp ${film_tmp1} ${film_tmp2} ${temp_damp} x 0.0 0.0 ${pres_damp} y 0.0 0.0 ${pres_damp} couple xy dilate all
+
+run           ${cyclesteps}
+
+#>>>print        "${film_tmp2}, ${film_t}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file}
+
+unfix         tmp_sub
+unfix         tmp_add
+unfix         myprint
+
+write_data ${outatom_file}2 nofix pair ij
+
+#-- (3) cool
+print         "*****************************************"
+print         "Starting cool 3 from ${film_tmp2} to ${film_tmp3} "
+print         "Maintaining P_x, P_y = 0"
+print         "*****************************************"
+fix          myprint all print ${datasteps} "${film_tmp3}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+fix           tmp_sub subatoms nvt temp ${film_tmp2} ${film_tmp3} ${temp_damp}
+fix           tmp_cap fcap     nvt temp ${film_tmp2} ${film_tmp3} ${temp_damp}
+fix           tmp_add addatoms npt temp ${film_tmp2} ${film_tmp3} ${temp_damp} x 0.0 0.0 ${pres_damp} y 0.0 0.0 ${pres_damp} couple xy dilate all
+
+run           ${cyclesteps}
+
+#>>>print        "${film_tmp3}, ${film_t}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file}
+
+unfix         tmp_sub
+unfix         tmp_add
+unfix         myprint
+
+write_data ${outatom_file}3 nofix pair ij
+
+#-- (4) cool
+print         "*****************************************"
+print         "Starting cool 4 from ${film_tmp3} to ${film_tmp4} "
+print         "Maintaining P_x, P_y = 0"
+print         "*****************************************"
+fix          myprint all print ${datasteps} "${film_tmp4}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+fix           tmp_sub subatoms nvt temp ${film_tmp3} ${film_tmp4} ${temp_damp}
+fix           tmp_cap fcap     nvt temp ${film_tmp3} ${film_tmp4} ${temp_damp}
+fix           tmp_add addatoms npt temp ${film_tmp3} ${film_tmp4} ${temp_damp} x 0.0 0.0 ${pres_damp} y 0.0 0.0 ${pres_damp} couple xy dilate all
+
+run           ${cyclesteps}
+
+#>>>print        "${film_tmp4}, ${film_t}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file}
+
+unfix         tmp_sub
+unfix         tmp_add
+unfix         myprint
+
+write_data ${outatom_file}4 nofix pair ij
+
+#-- (5) cool
+print         "*****************************************"
+print         "Starting cool 5 from ${film_tmp4} to ${film_tmp5} "
+print         "Maintaining P_x, P_y = 0"
+print         "*****************************************"
+fix          myprint all print ${datasteps} "${film_tmp5}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+fix           tmp_sub subatoms nvt temp ${film_tmp4} ${film_tmp5} ${temp_damp}
+fix           tmp_cap fcap     nvt temp ${film_tmp4} ${film_tmp5} ${temp_damp}
+fix           tmp_add addatoms npt temp ${film_tmp4} ${film_tmp5} ${temp_damp} x 0.0 0.0 ${pres_damp} y 0.0 0.0 ${pres_damp} couple xy dilate all
+
+run           ${cyclesteps}
+
+#>>>print        "${film_tmp5}, ${film_t}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file}
+
+unfix         tmp_sub
+unfix         tmp_add
+unfix         myprint
+
+write_data ${outatom_file}5 nofix pair ij
+
+#-- (6) cool
+print         "*****************************************"
+print         "Starting cool 6 from ${film_tmp5} to ${film_tmp6} "
+print         "Maintaining P_x, P_y = 0"
+print         "*****************************************"
+fix          myprint all print ${datasteps} "${film_tmp6}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+fix           tmp_sub subatoms nvt temp ${film_tmp5} ${film_tmp6} ${temp_damp}
+fix           tmp_cap fcap     nvt temp ${film_tmp5} ${film_tmp6} ${temp_damp}
+fix           tmp_add addatoms npt temp ${film_tmp5} ${film_tmp6} ${temp_damp} x 0.0 0.0 ${pres_damp} y 0.0 0.0 ${pres_damp} couple xy dilate all
+
+run           ${cyclesteps}
+
+#>>>print        "${film_tmp6}, ${film_t}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file}
+
+unfix         tmp_sub
+unfix         tmp_add
+unfix         myprint
+
+write_data ${outatom_file}6 nofix pair ij
+
+#-- (7) cool
+print         "*****************************************"
+print         "Starting cool 7 from ${film_tmp6} to ${film_tmp7} "
+print         "Maintaining P_x, P_y = 0"
+print         "*****************************************"
+fix          myprint all print ${datasteps} "${film_tmp7}, $(v_film_t:%.4f), $(v_box_width:%.3f), $(v_film_pe:%.4f), $(v_film_ke:%.4f), $(v_meas_pe:%.4f), $(v_volfract:%.5f)" append ${outres_file} screen no
+fix           tmp_sub subatoms nvt temp ${film_tmp6} ${film_tmp7} ${temp_damp}
+fix           tmp_cap fcap     nvt temp ${film_tmp6} ${film_tmp7} ${temp_damp}
+fix           tmp_add addatoms npt temp ${film_tmp6} ${film_tmp7} ${temp_damp} x 0.0 0.0 ${pres_damp} y 0.0 0.0 ${pres_damp} couple xy dilate all
+
+run           ${cyclesteps}
+
+#>>>print        "${film_tmp7}, ${film_t}, ${box_width}, ${film_pe}, ${film_ke}, {c_pt}, ${volfract}" append ${outres_file}
+
+unfix         tmp_sub
+unfix         tmp_add
+unfix         myprint
+
+write_data ${outatom_file}7 nofix pair ij
+write_restart ${restart_file}
+
+print       "***********************"
+print       "Dump cold film data complete"
+print       "Write restart file complete"
+print       "***********************"
+

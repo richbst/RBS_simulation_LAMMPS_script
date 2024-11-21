@@ -1,0 +1,1123 @@
+#-- deposition of poly-disperse atoms deposited
+#   onto crystalline substrate of atoms which interact strongly among themselves.
+#   compared to the added atoms.
+#   the added atoms have a range of lj parameters that determine interactions.
+#   program specifies parameter range and number of steps
+#   (the list of types in swap command must agree with the variable n_typ)
+#   The substrate and added atoms thermostatted separately with Nosé-Hoover 3 chain
+#   RB Stephens Nov 2022
+
+
+#-- cycles between deposition and equilibration
+#   deposition: single atoms in random positions amounting to about 0.1 layer
+#               the atoms having sigma, epsilon selected randomly 
+#               from flat distribution of 12 types
+#               distribution width given by w_poly
+#   equilibration: swap pairs of nearby atoms of randomly selected atom types
+#               within layer at surface of defined thickness
+#   characterization: calculates and outputs vol_density, relative large/med/small num_density,
+#                                and swap types binned by height within swap layer
+#   uses modified LAMMPS -version rbs-n: 
+#          key words in the fix atom/swap command
+#                poly - allows swap of atoms whose types are randomly selected from the type_list
+#                max_sep <distance> - only allows swaps between pairs closer than value
+#                dist <max> <bin_no> - returns distribution of swap distances
+#                    the indices go up to +/- bin_no, with max value corresponding to <max>,
+#                     -ve for unsuccessful, +ve for successful, and 0 for no pair found
+#                swaptypeheight <z_top> <z_bot> <z_bin_no> -records swap type and success 
+#                     binned by height in the swap region
+#         key words in the fix deposit command
+#                type = -1 -> types randomly selected from a type list in that command
+
+
+#-- simulation box
+variable    width   equal 10
+variable    height  equal 40
+
+#-- addatoms
+variable    d_width equal 0.25 # fractional width of dia and e distributions
+variable    max_dia equal 1.2
+variable    del_dia equal ${d_width}*${max_dia}
+variable    max_vol equal ${max_dia}*${max_dia}*${max_dia}/6.28
+variable    min_vol equal $(v_max_dia-v_del_dia)*$(v_max_dia-v_del_dia)*$(v_max_dia-v_del_dia)/6.28
+variable    avg_vol equal (${max_vol}+${min_vol})/2.0
+variable    cutoff  equal ${max_dia}*2.5
+variable    max_e   equal 1.0
+variable    del_e   equal ${d_width}*${max_e}
+variable    n_typ   equal 14    # number of steps in distribution + 1 for substrate + 1 for deposit type (no longer used) - >>>>>this is hardwired into program - don't change
+
+#-- substrate atoms
+variable    sub_dia equal 10.0/12.0*(${max_dia}-${del_dia})
+variable    sub_e   equal 10.0
+
+#-- substrate boundaries
+variable    sub_top equal 2*${sub_dia}+0.01
+variable    sub_bot equal 0.01
+
+#-- deposition parameters
+variable    dep_vel     equal -0.1    # z velocity with which atoms are injected
+variable    film_temp   equal 0.120
+variable    temp_damp   equal 10.0    #in units of tau
+variable    ins_space   equal 40000   # initial time-step interval for deposition cycle
+variable    f_ins_space equal 5000    # final time-step interval for deposition cycle
+variable    vol_cor     equal 1.4142
+
+#-- swap parameters
+variable    swap_temp   equal 0.170
+variable    swp_space equal ${ins_space}/10. # initial time-step interval for swap cycle
+variable    f_swp_space equal ${f_ins_space}/400. # final time-step interval for swap cycle
+variable    do_swap     equal 1        # 1 = yes, 0 = no
+variable    sw_top      equal 1.0      # distance of top of equilibrated region from surface
+variable    sw_thick    equal 6.0      # swap region thickness
+variable    sw_sep      equal 30       # max separation between swap pairs 
+                                       # (no effect if larger than 1/2 body diagonal of swap region)
+                                       # current code put restriction on z only
+variable    sw_atm_no   equal floor(${width}*${width}*${sw_thick}/${avg_vol}+0.5)  
+                                       # approx no of atoms in the swap region
+variable    hbin_no     equal 6        # >>>>>don't change! - it's built into the variable structure
+variable    sw_int      equal 20000
+
+#-- swap pair separation distribution data - if distribution keyword used
+variable    max_dist    equal 11
+variable    dist_no     equal 11
+
+#-- added atom number per deposition cycle - set equal to the number of added atom types
+#   note: for n_typ-2 = 12, somewhat larger than 0.1 layer
+variable    add_no      equal $(v_n_typ-2)
+                                       # add_no atoms added within the insertion cycle
+variable    dep_space   equal floor(${ins_space}/${add_no}+0.5) 
+variable    lyr_frac    equal ${avg_vol}*${add_no}/${width}*${width}
+variable    swap_no_per_cycle equal floor(${add_no}/2.0*${sw_int})
+variable    swap_cycle_length equal floor(${swp_space}*${sw_int})
+
+#-- end point for deposition (also stops when upper mirror hits box ceiling)
+variable    mx_fill     equal 0.9      # max fill as fraction of box height
+variable    typ_dens    equal 0.64     # overestimate based on prev. films
+variable    max_atm_no  equal ${mx_fill}*${width}*${width}*${height}*${typ_dens}/${avg_vol} 
+variable    loop_no     equal floor(${max_atm_no}/${add_no})
+variable    ploop_no    equal floor(2+v_hbin_no*(2*v_n_typ+1))
+
+#-- output file names defined by following code:
+#   v for set of runs around 0.17
+#   s for 10x shorter dep and swap time steps than original code
+#   p for 12-sized atom distribution
+#   n for swaptypeheight analysis - using LAMMPS version rbs-n 
+#   31 = deposition temp = 0.31 
+#   dash
+#   swap intensity: - the number of iterations of swap routine for every dep routine. We deposit and swap (n_typ-2) atoms,  so the intensity is the average number of swap attempts for each atom during its time in the swap layer.
+#   code the intensity roughly using its multiple of 2
+#   so 10,15, 20,35, 50,75, 100,150,200,350,500,750,1000,1500,2000,3500, 5000, 7500, 10000,15000,20000 
+#  ->  01,01+,02,02+,03,03+,04, 04+,05, 05+,06, 06+,07,  07+, 08,  08+, 09,   09+,  10
+#   addition to random seed to make runs independent.
+#   a-0, b-1, c-2, d-3, e-4, f-5, g-6, h-7, i-8, j-9, k-10
+variable   ser equal 0
+
+# in addition
+#   swap layer thickness is 6 - starting 1 below growth surface
+#   max allowed separation is 30 - much larger than swap region dimensions -
+
+#-- setting embedded in this script
+variable   file_pfx      index "vvspn120-11"
+variable   grow_label    index "filmtop"
+variable   atom_label    index "data"
+variable   restart_label index "restart"
+variable   text_end      index ".txt"
+variable   film_end      index ".film"
+variable   grow_file     index ${file_pfx}${grow_label}${text_end}
+variable   atom_file     index ${file_pfx}${atom_label}${film_end}
+variable   restart_file  index ${file_pfx}${restart_label}${film_end}
+
+#-- define particles
+units           lj      #units dimensionless, timestep 0.005 tau_red
+                        #where tau_red = tau * sqrt(e/(m sigma^2))
+                        #for Si atoms, timestep(sec) = 0.005*1.27x10^-12 = 6 fs
+atom_style      atomic
+boundary        p p f
+
+#-- substrate is crystalline
+lattice         fcc 1.0
+
+#-- make simulation volume
+region          box block 0 ${width} 0 ${width} 0 ${height} units box
+create_box      ${n_typ} box               # box contains n_typ kinds of atoms
+
+#-- add a reflective ceiling and lj floor
+fix             wall_blj  all wall/lj126 zlo EDGE ${sub_e} ${sub_dia} ${cutoff} units box
+fix             wall_tref all wall/reflect zhi ${height} units box
+
+#-- define regions
+region          subst    block 0.0 ${width} 0.0 ${width} ${sub_bot} ${sub_top} units box
+region          addfilm  block 0.0 ${width} 0.0 ${width} ${sub_top} ${height}  units box side in
+
+#-- fill substrate with atoms of type 1
+region          substrate block INF INF INF INF ${sub_bot} ${sub_top} units box
+create_atoms    1 region substrate
+
+#-- define atom sizes and their potentials
+pair_style      lj/cut ${cutoff}
+
+#-- substrate atom type
+pair_coeff      1  1   ${sub_e} ${sub_dia}    # substrate - crystalline
+
+#-- deposit atom type - no longer use this type for anything
+pair_coeff	2  2  ${max_e} ${max_dia}
+
+#-- deposited atom types - enough to create a semi-continuous distribution of properties
+variable        tmin equal 3
+variable        tmax equal ${n_typ}
+
+
+
+#-- create coefficients for all types
+#-- ==<>==<>==<>==<>==<>==<>==<>==<>==<>==
+label           tloop
+variable        tndx loop  ${tmin} ${tmax}
+pair_coeff      ${tndx} ${tndx}  $(v_max_e-(v_tndx-3)*v_del_e/(v_n_typ-3)) $(v_max_dia-(v_tndx-3)*v_del_dia/(v_n_typ-3))
+next        tndx
+jump        SELF tloop
+
+mass            * 1.0
+
+neigh_modify    delay 0
+
+#-- define groups in the different regions
+group           subatom     type 1
+group           flmatoms    subtract all subatom # 
+variable        flmatom_no  equal count(flmatoms)
+variable        subatom_no  equal count(subatom)
+
+#--groups for density calculation
+group    at03         type 3
+group    at04         type 4
+group    at05         type 5
+group    at06         type 6
+group    at07         type 7
+group    at08         type 8
+group    at09         type 9
+group    at10         type 10
+group    at11         type 11
+group    at12         type 12
+group    at13         type 13
+group    at14         type 14
+
+#-- sigmas for each type (a bit less than the diameter measured to lj minimum)
+variable    dia03   equal ${max_dia}
+variable    dia04   equal ${max_dia}-1.0/11.0*${del_dia}
+variable    dia05   equal ${max_dia}-2.0/11.0*${del_dia}
+variable    dia06   equal ${max_dia}-3.0/11.0*${del_dia}
+variable    dia07   equal ${max_dia}-4.0/11.0*${del_dia}
+variable    dia08   equal ${max_dia}-5.0/11.0*${del_dia}
+variable    dia09   equal ${max_dia}-6.0/11.0*${del_dia}
+variable    dia10   equal ${max_dia}-7.0/11.0*${del_dia}
+variable    dia11   equal ${max_dia}-8.0/11.0*${del_dia}
+variable    dia12   equal ${max_dia}-9.0/11.0*${del_dia}
+variable    dia13   equal ${max_dia}-10.0/11.0*${del_dia}
+variable    dia14   equal ${max_dia}-${del_dia}
+
+#-- volumes for each type (calculating to minimum in lj potential
+variable    va03    equal 3.14159/6.0*${dia03}*${dia03}*${dia03}*${vol_cor}
+variable    va04    equal 3.14159/6.0*${dia04}*${dia04}*${dia04}*${vol_cor}
+variable    va05    equal 3.14159/6.0*${dia05}*${dia05}*${dia05}*${vol_cor}
+variable    va06    equal 3.14159/6.0*${dia06}*${dia06}*${dia06}*${vol_cor}
+variable    va07    equal 3.14159/6.0*${dia07}*${dia07}*${dia07}*${vol_cor}
+variable    va08    equal 3.14159/6.0*${dia08}*${dia08}*${dia08}*${vol_cor}
+variable    va09    equal 3.14159/6.0*${dia09}*${dia09}*${dia09}*${vol_cor}
+variable    va10    equal 3.14159/6.0*${dia10}*${dia10}*${dia10}*${vol_cor}
+variable    va11    equal 3.14159/6.0*${dia11}*${dia11}*${dia11}*${vol_cor}
+variable    va12    equal 3.14159/6.0*${dia12}*${dia12}*${dia12}*${vol_cor}
+variable    va13    equal 3.14159/6.0*${dia13}*${dia13}*${dia13}*${vol_cor}
+variable    va14    equal 3.14159/6.0*${dia14}*${dia14}*${dia14}*${vol_cor}
+variable    regvol  equal ${width}*${width}   # <<<< assuming bin region height = 1
+
+#    no flmatoms yet - the group and compute have to be periodically renewed to include added atoms
+#   (note: in this version, there are never any type 2 atoms)
+
+#-- compute temperature
+compute         t_add flmatoms temp
+compute         t_sub subatom temp
+variable        meas_temp equal c_t_add
+
+#-- remove lateral drift
+fix             drift all momentum 1 linear 1 1 0
+
+#-- link subatoms into a rigid block and warm to deposition temp
+fix             tmp_rig_sub subatom rigid/nvt group 1 subatom temp 0.1 ${film_temp} ${temp_damp}
+
+run             10000
+
+unfix           tmp_rig_sub
+
+#-- continue at deposition temp- include addatoms
+fix             tmp_rig_sub subatom rigid/nvt group 1 subatom temp ${film_temp} ${film_temp} ${temp_damp}
+fix             tmp_flm     flmatoms  nvt temp ${film_temp} ${film_temp} ${temp_damp}
+
+#-- define film top
+compute     ft all property/atom z
+compute     mft all reduce max c_ft
+variable    film_top equal c_mft
+
+#-- define ceiling and swap region boundaries relative to film top (regions reset on each cycle)
+
+
+variable    elapsed_cyc equal elaplong
+variable    atom_no equal atoms  #total atoms
+variable    step_no equal step   #time step
+
+#-- print temperatures, film height and atom number
+thermo_style    custom step atoms v_subatom_no v_flmatom_no c_t_sub c_t_add c_mft
+thermo          20000
+thermo_modify lost ignore
+
+run         0   # used to set thermo parameters
+
+
+#-- put program parameters into output file
+print       "Polydisperse film:, ${grow_file}" file ${grow_file} screen no
+print       "Space_dim:, top:, ${height}, bottom:, ${sub_bot}, sub_top:, ${sub_top}, width:, ${width}" append ${grow_file} screen no
+print       "Atom Sigmas:, ${dia03}, ${dia04}, ${dia05}, ${dia06}, ${dia07}, ${dia08}, ${dia09}, ${dia10}, ${dia11}, ${dia12}, ${dia13}, ${dia14}" append ${grow_file} screen no
+print       "Atom epsilons:, add atom, max:, ${max_e}, del:, ${del_e}, substrate:, ${sub_e}" append ${grow_file} screen no
+print       "Atom Volumes:, ${va03}, ${va04}, ${va05}, ${va06}, ${va07}, ${va08}, ${va09}, ${va10}, ${va11}, ${va12}, ${va13}, ${va14}" append ${grow_file} screen no
+print       "Add_params1:, add_no:, ${add_no}, layer_per_cycle:, ${lyr_frac} ins_space:, ${ins_space}, swp_space:, ${swp_space}, swp_temp:, ${swap_temp} $" append ${grow_file} screen no
+print       "Add_params2:, dep_velocity:, ${dep_vel}" append ${grow_file} screen no
+print       "Dep_temp:, film_set_temp:, ${film_temp}, temp_damping:, ${temp_damp}" append ${grow_file} screen no
+print       "Swapping:, do_swap:, ${do_swap}, swap_top:, ${sw_top}, swap_thick:, ${sw_thick}, sw_int:, ${sw_int}, swp_sep: ${sw_sep}, swap_dist_max:, ${max_dist}, swap_dist_no:, ${dist_no}" append ${grow_file} screen no
+print       "======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======,======" append ${grow_file} screen no
+print       "Loop, |||, Swap, , |||,,,,,, Swap Fail bin 1,,,,,,, |||, , |||,,,,,, Swap Success bin 1,,,,,,, |||,,,,,, Swap Fail bin 2,,,,,,, |||, , |||,,,,,, Swap Success bin 2,,,,,,, |||,,,,,, Fail bin 3,,,,,,, |||, , |||,,,,,, Swap Success bin 3,,,,,,, |||,,,,,, Swap Fail bin 4,,,,,,, |||, , |||,,,,,, Swap Success bin 4,,,,,,, |||,,,,,, Swap Fail bin 5,,,,,,, |||, , |||,,,,,, Swap Success bin 5,,,,,,, |||,,,,,, Swap Fail bin 6,,,,,,, |||,, |||,,,,,, Swap Success bin 6,,,,,,, |||,, number bin1 ,, |||,, number bin2,, |||,, number bin3,, |||,, number bin4,, |||,, number bin5,, |||,, number bin6,, |||,, number bin7,, |||,, number bin8,, |||,,,, volume density,,,,, |||," append ${grow_file} screen no
+print       "Index, |||, Attempt, Success, |||, 14, 13, 12, 11, 10, 9, 8 ,7, 6, 5, 4, 3, |||, none, ||| , 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, |||, 14, 13, 12, 11, 10, 9, 8 ,7, 6, 5, 4, 3, |||, none, ||| , 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, |||, 14, 13, 12, 11, 10, 9, 8 ,7, 6, 5, 4, 3, |||, none, ||| , 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, |||, 14, 13, 12, 11, 10, 9, 8 ,7, 6, 5, 4, 3, |||, none, ||| , 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, |||, 14, 13, 12, 11, 10, 9, 8 ,7, 6, 5, 4, 3, |||, none, ||| , 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, |||, 14, 13, 12, 11, 10, 9, 8 ,7, 6, 5, 4, 3, |||, none, ||| , 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, |||, large, med, small, |||, large, med, small, |||, large, med, small, |||, large, med, small, |||, large, med, small, |||, large, med, small, |||, large, med, small, |||, large, med, small, |||, bin1, bin2, bin3, bin4, bin5, bin6, bin7, bin8, |||" append ${grow_file} screen no
+
+#-- ==<>==<>==<>==<>==<>==<>==<>==<>==<>==
+label       lloop       # beginning of loop for adding layers
+variable    indx loop  ${loop_no}
+print ">>>>>>>>outer loop index = ${indx} <<<<<<<<<<"
+if "${film_top}>$(v_height*v_mx_fill)" then &
+    "print 'final film_top = ${film_top}'" &
+    "jump SELF break"
+#-- note the random seeds below are different on every call
+
+#-- calculate temperature of the film (the group is periodically deleted and redefined to update count after adding atoms)
+unfix     tmp_flm
+uncompute t_add
+group     flmatoms delete               # redefine to include deposited atoms
+group     at03     delete
+group     at04     delete
+group     at05     delete
+group     at06     delete
+group     at07     delete
+group     at08     delete
+group     at09     delete
+group     at10     delete
+group     at11     delete
+group     at12     delete
+group     at13     delete
+group     at14     delete
+
+group     flmatoms subtract all subatom
+group    at03         type 3
+group    at04         type 4
+group    at05         type 5
+group    at06         type 6
+group    at07         type 7
+group    at08         type 8
+group    at09         type 9
+group    at10         type 10
+group    at11         type 11
+group    at12         type 12
+group    at13         type 13
+group    at14         type 14
+
+compute   t_add flmatoms temp
+fix       tmp_flm flmatoms  nvt temp ${film_temp} ${film_temp} ${temp_damp}
+
+#-- add a reflective ceiling just above deposition region
+variable    ceiling equal  c_mft+3.0
+fix         c_ref all wall/reflect zhi ${ceiling} units box
+
+if "${ceiling}>${height}" then &
+    "print 'final ceiling = ${ceiling}'" &
+    "jump SELF break"
+    
+#-- on each cycle insert ~12 atoms of random type in ins_space steps into a region 1 2 above the highest atom within 2 laterally of selected position
+
+#-- ==<>==<>==<>==<>==<>==<>==<>==<>==<>==
+#  deposit about 0.1 layer of addatoms (12 atoms)
+#  each atom deposited into a region 1 2 above the highest atom
+#  and within 2 laterally of randomly selected position
+#  after 10 cycles, reduce ins_space and dep_space by 10x
+
+if (${indx}==10) then &
+   "variable ins_space delete " &
+   "variable ins_space equal ${f_ins_space} " &
+   "variable swp_space delete " & 
+   "variable swp_space equal ${f_swp_space} " &
+   "variable dep_space delete " &
+   "variable dep_space equal floor(${ins_space}/${add_no}+0.5) " &
+   "variable swap_cycle_length delete " &
+   "variable swap_cycle_length equal floor(${swp_space}*${sw_int}) " &
+
+fix         dep_atm flmatoms deposit ${add_no} -1 ${dep_space} $(5368917+v_indx+v_ser) region addfilm local 1.5 1.5 1.5 vz ${dep_vel} ${dep_vel} units box types 3 4 5 6 7 8 9 10 11 12 13 14
+
+run         ${ins_space}
+unfix       dep_atm
+
+if "!(${do_swap} == 1)" then "jump SELF no_equil"
+if "${indx}<10" then "jump SELF no_equil"
+if "($(v_film_top-v_sw_top-v_sw_thick)<=${sub_bot})" then "jump SELF no_equil"
+
+#-- ==<>==<>==<>==<>==<>==<>==<>==<>==<>==
+# beginning of swap interval for atoms within the defined surface region
+
+region  equil block 0 ${width} 0 ${width} $(v_film_top-v_sw_top-v_sw_thick) $(v_film_top-v_sw_top) side in units box
+group   equil dynamic all region equil every 50
+
+#-- define regions for calculating density
+variable    den_z0 equal c_mft-${sw_top}
+variable    den_z1 equal c_mft-${sw_top}-1*${sw_thick}/${hbin_no}
+variable    den_z2 equal c_mft-${sw_top}-2*${sw_thick}/${hbin_no}
+variable    den_z3 equal c_mft-${sw_top}-3*${sw_thick}/${hbin_no}
+variable    den_z4 equal c_mft-${sw_top}-4*${sw_thick}/${hbin_no}
+variable    den_z5 equal c_mft-${sw_top}-5*${sw_thick}/${hbin_no}
+variable    den_z6 equal c_mft-${sw_top}-6*${sw_thick}/${hbin_no}
+variable    den_z7 equal c_mft-${sw_top}-7*${sw_thick}/${hbin_no}
+variable    den_z8 equal c_mft-${sw_top}-8*${sw_thick}/${hbin_no}
+
+region      den_r1 block 0 ${width} 0 ${width} ${den_z1} ${den_z0} side in units box
+region      den_r2 block 0 ${width} 0 ${width} ${den_z2} ${den_z1} side in units box
+region      den_r3 block 0 ${width} 0 ${width} ${den_z3} ${den_z2} side in units box
+region      den_r4 block 0 ${width} 0 ${width} ${den_z4} ${den_z3} side in units box
+region      den_r5 block 0 ${width} 0 ${width} ${den_z5} ${den_z4} side in units box
+region      den_r6 block 0 ${width} 0 ${width} ${den_z6} ${den_z5} side in units box
+region      den_r7 block 0 ${width} 0 ${width} ${den_z7} ${den_z6} side in units box
+region      den_r8 block 0 ${width} 0 ${width} ${den_z8} ${den_z7} side in units box
+
+group       den_r1 dynamic all region den_r1 every 50
+group       den_r2 dynamic all region den_r2 every 50
+group       den_r3 dynamic all region den_r3 every 50
+group       den_r4 dynamic all region den_r4 every 50
+group       den_r5 dynamic all region den_r5 every 50
+group       den_r6 dynamic all region den_r6 every 50
+group       den_r7 dynamic all region den_r7 every 50
+group       den_r8 dynamic all region den_r8 every 50
+
+variable    num_eq equal count(equil)
+variable    num_r1 equal count(den_r1)
+variable    num_r2 equal count(den_r2)
+variable    num_r3 equal count(den_r3)
+variable    num_r4 equal count(den_r4)
+variable    num_r5 equal count(den_r5)
+variable    num_r6 equal count(den_r6)
+variable    num_r7 equal count(den_r7)
+variable    num_r8 equal count(den_r8)
+
+#--calculation of number densities
+variable    nden03_1   equal count(at03,den_r1)
+variable    nden04_1   equal count(at04,den_r1)
+variable    nden05_1   equal count(at05,den_r1)
+variable    nden06_1   equal count(at06,den_r1)
+variable    nden07_1   equal count(at07,den_r1)
+variable    nden08_1   equal count(at08,den_r1)
+variable    nden09_1   equal count(at09,den_r1)
+variable    nden10_1   equal count(at10,den_r1)
+variable    nden11_1   equal count(at11,den_r1)
+variable    nden12_1   equal count(at12,den_r1)
+variable    nden13_1   equal count(at13,den_r1)
+variable    nden14_1   equal count(at14,den_r1)
+
+variable    nden03_2   equal count(at03,den_r2)
+variable    nden04_2   equal count(at04,den_r2)
+variable    nden05_2   equal count(at05,den_r2)
+variable    nden06_2   equal count(at06,den_r2)
+variable    nden07_2   equal count(at07,den_r2)
+variable    nden08_2   equal count(at08,den_r2)
+variable    nden09_2   equal count(at09,den_r2)
+variable    nden10_2   equal count(at10,den_r2)
+variable    nden11_2   equal count(at11,den_r2)
+variable    nden12_2   equal count(at12,den_r2)
+variable    nden13_2   equal count(at13,den_r2)
+variable    nden14_2   equal count(at14,den_r2)
+
+variable    nden03_3   equal count(at03,den_r3)
+variable    nden04_3   equal count(at04,den_r3)
+variable    nden05_3   equal count(at05,den_r3)
+variable    nden06_3   equal count(at06,den_r3)
+variable    nden07_3   equal count(at07,den_r3)
+variable    nden08_3   equal count(at08,den_r3)
+variable    nden09_3   equal count(at09,den_r3)
+variable    nden10_3   equal count(at10,den_r3)
+variable    nden11_3   equal count(at11,den_r3)
+variable    nden12_3   equal count(at12,den_r3)
+variable    nden13_3   equal count(at13,den_r3)
+variable    nden14_3   equal count(at14,den_r3)
+
+variable    nden03_4   equal count(at03,den_r4)
+variable    nden04_4   equal count(at04,den_r4)
+variable    nden05_4   equal count(at05,den_r4)
+variable    nden06_4   equal count(at06,den_r4)
+variable    nden07_4   equal count(at07,den_r4)
+variable    nden08_4   equal count(at08,den_r4)
+variable    nden09_4   equal count(at09,den_r4)
+variable    nden10_4   equal count(at10,den_r4)
+variable    nden11_4   equal count(at11,den_r4)
+variable    nden12_4   equal count(at12,den_r4)
+variable    nden13_4   equal count(at13,den_r4)
+variable    nden14_4   equal count(at14,den_r4)
+
+variable    nden03_5   equal count(at03,den_r5)
+variable    nden04_5   equal count(at04,den_r5)
+variable    nden05_5   equal count(at05,den_r5)
+variable    nden06_5   equal count(at06,den_r5)
+variable    nden07_5   equal count(at07,den_r5)
+variable    nden08_5   equal count(at08,den_r5)
+variable    nden09_5   equal count(at09,den_r5)
+variable    nden10_5   equal count(at10,den_r5)
+variable    nden11_5   equal count(at11,den_r5)
+variable    nden12_5   equal count(at12,den_r5)
+variable    nden13_5   equal count(at13,den_r5)
+variable    nden14_5   equal count(at14,den_r5)
+
+variable    nden03_6   equal count(at03,den_r6)
+variable    nden04_6   equal count(at04,den_r6)
+variable    nden05_6   equal count(at05,den_r6)
+variable    nden06_6   equal count(at06,den_r6)
+variable    nden07_6   equal count(at07,den_r6)
+variable    nden08_6   equal count(at08,den_r6)
+variable    nden09_6   equal count(at09,den_r6)
+variable    nden10_6   equal count(at10,den_r6)
+variable    nden11_6   equal count(at11,den_r6)
+variable    nden12_6   equal count(at12,den_r6)
+variable    nden13_6   equal count(at13,den_r6)
+variable    nden14_6   equal count(at14,den_r6)
+
+variable    nden03_7   equal count(at03,den_r7)
+variable    nden04_7   equal count(at04,den_r7)
+variable    nden05_7   equal count(at05,den_r7)
+variable    nden06_7   equal count(at06,den_r7)
+variable    nden07_7   equal count(at07,den_r7)
+variable    nden08_7   equal count(at08,den_r7)
+variable    nden09_7   equal count(at09,den_r7)
+variable    nden10_7   equal count(at10,den_r7)
+variable    nden11_7   equal count(at11,den_r7)
+variable    nden12_7   equal count(at12,den_r7)
+variable    nden13_7   equal count(at13,den_r7)
+variable    nden14_7   equal count(at14,den_r7)
+
+variable    nden03_8   equal count(at03,den_r8)
+variable    nden04_8   equal count(at04,den_r8)
+variable    nden05_8   equal count(at05,den_r8)
+variable    nden06_8   equal count(at06,den_r8)
+variable    nden07_8   equal count(at07,den_r8)
+variable    nden08_8   equal count(at08,den_r8)
+variable    nden09_8   equal count(at09,den_r8)
+variable    nden10_8   equal count(at10,den_r8)
+variable    nden11_8   equal count(at11,den_r8)
+variable    nden12_8   equal count(at12,den_r8)
+variable    nden13_8   equal count(at13,den_r8)
+variable    nden14_8   equal count(at14,den_r8)
+
+variable    vden1 equal   (${nden03_1}*${va03}+${nden04_1}*${va04}+${nden05_1}*${va05}+${nden06_1}*${va06}+${nden07_1}*${va07}+${nden08_1}*${va08}+${nden09_1}*${va09}+${nden10_1}*${va10}+${nden11_1}*${va11}+${nden12_1}*${va12}+${nden13_1}*${va13}+${nden14_1}*${va14})/${regvol}
+variable    vden2   equal (${nden03_2}*${va03}+${nden04_2}*${va04}+${nden05_2}*${va05}+${nden06_2}*${va06}+${nden07_2}*${va07}+${nden08_2}*${va08}+${nden09_2}*${va09}+${nden10_2}*${va10}+${nden11_2}*${va11}+${nden12_2}*${va12}+${nden13_2}*${va13}+${nden14_2}*${va14})/${regvol}
+variable    vden3   equal (${nden03_3}*${va03}+${nden04_3}*${va04}+${nden05_3}*${va05}+${nden06_3}*${va06}+${nden07_3}*${va07}+${nden08_3}*${va08}+${nden09_3}*${va09}+${nden10_3}*${va10}+${nden11_3}*${va11}+${nden12_3}*${va12}+${nden13_3}*${va13}+${nden14_3}*${va14})/${regvol}
+variable    vden4   equal (${nden03_4}*${va03}+${nden04_4}*${va04}+${nden05_4}*${va05}+${nden06_4}*${va06}+${nden07_4}*${va07}+${nden08_4}*${va08}+${nden09_4}*${va09}+${nden10_4}*${va10}+${nden11_4}*${va11}+${nden12_4}*${va12}+${nden13_4}*${va13}+${nden14_4}*${va14})/${regvol}
+variable    vden5   equal (${nden03_5}*${va03}+${nden04_5}*${va04}+${nden05_5}*${va05}+${nden06_5}*${va06}+${nden07_5}*${va07}+${nden08_5}*${va08}+${nden09_5}*${va09}+${nden10_5}*${va10}+${nden11_5}*${va11}+${nden12_5}*${va12}+${nden13_5}*${va13}+${nden14_5}*${va14})/${regvol}
+variable    vden6   equal (${nden03_6}*${va03}+${nden04_6}*${va04}+${nden05_6}*${va05}+${nden06_6}*${va06}+${nden07_6}*${va07}+${nden08_6}*${va08}+${nden09_6}*${va09}+${nden10_6}*${va10}+${nden11_6}*${va11}+${nden12_6}*${va12}+${nden13_6}*${va13}+${nden14_6}*${va14})/${regvol}
+variable    vden7   equal (${nden03_7}*${va03}+${nden04_7}*${va04}+${nden05_7}*${va05}+${nden06_7}*${va06}+${nden07_7}*${va07}+${nden08_7}*${va08}+${nden09_7}*${va09}+${nden10_7}*${va10}+${nden11_7}*${va11}+${nden12_7}*${va12}+${nden13_7}*${va13}+${nden14_7}*${va14})/${regvol}
+variable    vden8   equal (${nden03_8}*${va03}+${nden04_8}*${va04}+${nden05_8}*${va05}+${nden06_8}*${va06}+${nden07_8}*${va07}+${nden08_8}*${va08}+${nden09_8}*${va09}+${nden10_8}*${va10}+${nden11_8}*${va11}+${nden12_8}*${va12}+${nden13_8}*${va13}+${nden14_8}*${va14})/${regvol}
+
+#--calculation of number densities (grouped into three sizes, binned by height)
+variable    ndena1 equal  ${nden03_1}+${nden04_1}+${nden05_1}+${nden06_1}
+variable    ndenb1 equal  ${nden07_1}+${nden08_1}+${nden09_1}+${nden10_1}
+variable    ndenc1 equal  ${nden11_1}+${nden12_1}+${nden13_1}+${nden14_1}
+variable    ndena2 equal  ${nden03_2}+${nden04_2}+${nden05_2}+${nden06_2}
+variable    ndenb2 equal  ${nden07_2}+${nden08_2}+${nden09_2}+${nden10_2}
+variable    ndenc2 equal  ${nden11_2}+${nden12_2}+${nden13_2}+${nden14_2}
+variable    ndena3 equal  ${nden03_3}+${nden04_3}+${nden05_3}+${nden06_3}
+variable    ndenb3 equal  ${nden07_3}+${nden08_3}+${nden09_3}+${nden10_3}
+variable    ndenc3 equal  ${nden11_3}+${nden12_3}+${nden13_3}+${nden14_3}
+variable    ndena4 equal  ${nden03_4}+${nden04_4}+${nden05_4}+${nden06_4}
+variable    ndenb4 equal  ${nden07_4}+${nden08_4}+${nden09_4}+${nden10_4}
+variable    ndenc4 equal  ${nden11_4}+${nden12_4}+${nden13_4}+${nden14_4}
+variable    ndena5 equal  ${nden03_5}+${nden04_5}+${nden05_5}+${nden06_5}
+variable    ndenb5 equal  ${nden07_5}+${nden08_5}+${nden09_5}+${nden10_5}
+variable    ndenc5 equal  ${nden11_5}+${nden12_5}+${nden13_5}+${nden14_5}
+variable    ndena6 equal  ${nden03_6}+${nden04_6}+${nden05_6}+${nden06_6}
+variable    ndenb6 equal  ${nden07_6}+${nden08_6}+${nden09_6}+${nden10_6}
+variable    ndenc6 equal  ${nden11_6}+${nden12_6}+${nden13_6}+${nden14_6}
+variable    ndena7 equal  ${nden03_7}+${nden04_7}+${nden05_7}+${nden06_7}
+variable    ndenb7 equal  ${nden07_7}+${nden08_7}+${nden09_7}+${nden10_7}
+variable    ndenc7 equal  ${nden11_7}+${nden12_7}+${nden13_7}+${nden14_7}
+variable    ndena8 equal  ${nden03_8}+${nden04_8}+${nden05_8}+${nden06_8}
+variable    ndenb8 equal  ${nden07_8}+${nden08_8}+${nden09_8}+${nden10_8}
+variable    ndenc8 equal  ${nden11_8}+${nden12_8}+${nden13_8}+${nden14_8}
+
+#-- define regions for calculating density
+variable    den_z0 equal c_mft-${sw_top}
+variable    den_z1 equal c_mft-${sw_top}-1*${sw_thick}/${hbin_no}
+variable    den_z2 equal c_mft-${sw_top}-2*${sw_thick}/${hbin_no}
+variable    den_z3 equal c_mft-${sw_top}-3*${sw_thick}/${hbin_no}
+variable    den_z4 equal c_mft-${sw_top}-4*${sw_thick}/${hbin_no}
+variable    den_z5 equal c_mft-${sw_top}-5*${sw_thick}/${hbin_no}
+variable    den_z6 equal c_mft-${sw_top}-6*${sw_thick}/${hbin_no}
+variable    den_z7 equal c_mft-${sw_top}-7*${sw_thick}/${hbin_no}
+variable    den_z8 equal c_mft-${sw_top}-8*${sw_thick}/${hbin_no}
+
+fix     swp_atm equil atom/swap ${swap_cycle_length} ${swap_no_per_cycle} $(1368918+v_indx+v_ser) ${swap_temp} dist_sep z ${sw_sep} region equil swaptypeheight $(v_film_top-v_sw_top) $(v_film_top-v_sw_top-v_sw_thick) ${hbin_no} poly types 3 4 5 6 7 8 9 10 11 12 13 14
+
+run         ${swap_cycle_length}
+
+#-- output swap results in f_swp_atm[x]
+#   [1] is total attempted swaps
+#   [2] is total successful swaps
+#   [3] and up are swap numbers binned by type and height in swap region
+variable    sw_att equal f_swp_atm[1] # total swap attempts
+variable    sw_suc equal f_swp_atm[2] # total swap successes
+variable    an1_14 equal f_swp_atm[3] # unsuccessful swaps in top bin sorted by type
+variable    an1_13 equal f_swp_atm[4]
+variable    an1_12 equal f_swp_atm[5]
+variable    an1_11 equal f_swp_atm[6]
+variable    an1_10 equal f_swp_atm[7]
+variable    an1_09 equal f_swp_atm[8]
+variable    an1_08 equal f_swp_atm[9]
+variable    an1_07 equal f_swp_atm[10]
+variable    an1_06 equal f_swp_atm[11]
+variable    an1_05 equal f_swp_atm[12]
+variable    an1_04 equal f_swp_atm[13]
+variable    an1_03 equal f_swp_atm[14]
+variable    ax1_00 equal f_swp_atm[17] # no suitable partner found
+variable    ap1_03 equal f_swp_atm[20] # successful swaps in top bin sorted by type
+variable    ap1_04 equal f_swp_atm[21]
+variable    ap1_05 equal f_swp_atm[22]
+variable    ap1_06 equal f_swp_atm[23]
+variable    ap1_07 equal f_swp_atm[24]
+variable    ap1_08 equal f_swp_atm[25]
+variable    ap1_09 equal f_swp_atm[26]
+variable    ap1_10 equal f_swp_atm[27]
+variable    ap1_11 equal f_swp_atm[28]
+variable    ap1_12 equal f_swp_atm[29]
+variable    ap1_13 equal f_swp_atm[30]
+variable    ap1_14 equal f_swp_atm[31]
+
+variable    row_no equal 29
+variable    an2_14 equal f_swp_atm[$(v_row_no+3)] # unsuccessful swaps in 2nd bin sorted by type
+variable    an2_13 equal f_swp_atm[$(v_row_no+4)]
+variable    an2_12 equal f_swp_atm[$(v_row_no+5)]
+variable    an2_11 equal f_swp_atm[$(v_row_no+6)]
+variable    an2_10 equal f_swp_atm[$(v_row_no+7)]
+variable    an2_09 equal f_swp_atm[$(v_row_no+8)]
+variable    an2_08 equal f_swp_atm[$(v_row_no+9)]
+variable    an2_07 equal f_swp_atm[$(v_row_no+10)]
+variable    an2_06 equal f_swp_atm[$(v_row_no+11)]
+variable    an2_05 equal f_swp_atm[$(v_row_no+12)]
+variable    an2_04 equal f_swp_atm[$(v_row_no+13)]
+variable    an2_03 equal f_swp_atm[$(v_row_no+14)]
+variable    ax2_00 equal f_swp_atm[$(v_row_no+17)] # no suitable partner found
+variable    ap2_03 equal f_swp_atm[$(v_row_no+20)] # successful swaps in 2nd bin sorted by type
+variable    ap2_04 equal f_swp_atm[$(v_row_no+21)]
+variable    ap2_05 equal f_swp_atm[$(v_row_no+22)]
+variable    ap2_06 equal f_swp_atm[$(v_row_no+23)]
+variable    ap2_07 equal f_swp_atm[$(v_row_no+24)]
+variable    ap2_08 equal f_swp_atm[$(v_row_no+25)]
+variable    ap2_09 equal f_swp_atm[$(v_row_no+26)]
+variable    ap2_10 equal f_swp_atm[$(v_row_no+27)]
+variable    ap2_11 equal f_swp_atm[$(v_row_no+28)]
+variable    ap2_12 equal f_swp_atm[$(v_row_no+29)]
+variable    ap2_13 equal f_swp_atm[$(v_row_no+30)]
+variable    ap2_14 equal f_swp_atm[$(v_row_no+31)]
+
+variable    an3_14 equal f_swp_atm[$(2*v_row_no+3)] # unsuccessful swaps in 2nd bin sorted by type
+variable    an3_13 equal f_swp_atm[$(2*v_row_no+4)]
+variable    an3_12 equal f_swp_atm[$(2*v_row_no+5)]
+variable    an3_11 equal f_swp_atm[$(2*v_row_no+6)]
+variable    an3_10 equal f_swp_atm[$(2*v_row_no+7)]
+variable    an3_09 equal f_swp_atm[$(2*v_row_no+8)]
+variable    an3_08 equal f_swp_atm[$(2*v_row_no+9)]
+variable    an3_07 equal f_swp_atm[$(2*v_row_no+10)]
+variable    an3_06 equal f_swp_atm[$(2*v_row_no+11)]
+variable    an3_05 equal f_swp_atm[$(2*v_row_no+12)]
+variable    an3_04 equal f_swp_atm[$(2*v_row_no+13)]
+variable    an3_03 equal f_swp_atm[$(2*v_row_no+14)]
+variable    ax3_00 equal f_swp_atm[$(2*v_row_no+17)] # no suitable partner found
+variable    ap3_03 equal f_swp_atm[$(2*v_row_no+20)] # successful swaps in 2nd bin sorted by type
+variable    ap3_04 equal f_swp_atm[$(2*v_row_no+21)]
+variable    ap3_05 equal f_swp_atm[$(2*v_row_no+22)]
+variable    ap3_06 equal f_swp_atm[$(2*v_row_no+23)]
+variable    ap3_07 equal f_swp_atm[$(2*v_row_no+24)]
+variable    ap3_08 equal f_swp_atm[$(2*v_row_no+25)]
+variable    ap3_09 equal f_swp_atm[$(2*v_row_no+26)]
+variable    ap3_10 equal f_swp_atm[$(2*v_row_no+27)]
+variable    ap3_11 equal f_swp_atm[$(2*v_row_no+28)]
+variable    ap3_12 equal f_swp_atm[$(2*v_row_no+29)]
+variable    ap3_13 equal f_swp_atm[$(2*v_row_no+30)]
+variable    ap3_14 equal f_swp_atm[$(2*v_row_no+31)]
+
+variable    an4_14 equal f_swp_atm[$(3*v_row_no+3)] # unsuccessful swaps in 2nd bin sorted by type
+variable    an4_13 equal f_swp_atm[$(3*v_row_no+4)]
+variable    an4_12 equal f_swp_atm[$(3*v_row_no+5)]
+variable    an4_11 equal f_swp_atm[$(3*v_row_no+6)]
+variable    an4_10 equal f_swp_atm[$(3*v_row_no+7)]
+variable    an4_09 equal f_swp_atm[$(3*v_row_no+8)]
+variable    an4_08 equal f_swp_atm[$(3*v_row_no+9)]
+variable    an4_07 equal f_swp_atm[$(3*v_row_no+10)]
+variable    an4_06 equal f_swp_atm[$(3*v_row_no+11)]
+variable    an4_05 equal f_swp_atm[$(3*v_row_no+12)]
+variable    an4_04 equal f_swp_atm[$(3*v_row_no+13)]
+variable    an4_03 equal f_swp_atm[$(3*v_row_no+14)]
+variable    ax4_00 equal f_swp_atm[$(3*v_row_no+17)] # no suitable partner found
+variable    ap4_03 equal f_swp_atm[$(3*v_row_no+20)] # successful swaps in 2nd bin sorted by type
+variable    ap4_04 equal f_swp_atm[$(3*v_row_no+21)]
+variable    ap4_05 equal f_swp_atm[$(3*v_row_no+22)]
+variable    ap4_06 equal f_swp_atm[$(3*v_row_no+23)]
+variable    ap4_07 equal f_swp_atm[$(3*v_row_no+24)]
+variable    ap4_08 equal f_swp_atm[$(3*v_row_no+25)]
+variable    ap4_09 equal f_swp_atm[$(3*v_row_no+26)]
+variable    ap4_10 equal f_swp_atm[$(3*v_row_no+27)]
+variable    ap4_11 equal f_swp_atm[$(3*v_row_no+28)]
+variable    ap4_12 equal f_swp_atm[$(3*v_row_no+29)]
+variable    ap4_13 equal f_swp_atm[$(3*v_row_no+30)]
+variable    ap4_14 equal f_swp_atm[$(3*v_row_no+31)]
+
+variable    an5_14 equal f_swp_atm[$(4*v_row_no+3)] # unsuccessful swaps in 2nd bin sorted by type
+variable    an5_13 equal f_swp_atm[$(4*v_row_no+4)]
+variable    an5_12 equal f_swp_atm[$(4*v_row_no+5)]
+variable    an5_11 equal f_swp_atm[$(4*v_row_no+6)]
+variable    an5_10 equal f_swp_atm[$(4*v_row_no+7)]
+variable    an5_09 equal f_swp_atm[$(4*v_row_no+8)]
+variable    an5_08 equal f_swp_atm[$(4*v_row_no+9)]
+variable    an5_07 equal f_swp_atm[$(4*v_row_no+10)]
+variable    an5_06 equal f_swp_atm[$(4*v_row_no+11)]
+variable    an5_05 equal f_swp_atm[$(4*v_row_no+12)]
+variable    an5_04 equal f_swp_atm[$(4*v_row_no+13)]
+variable    an5_03 equal f_swp_atm[$(4*v_row_no+14)]
+variable    ax5_00 equal f_swp_atm[$(4*v_row_no+17)] # no suitable partner found
+variable    ap5_03 equal f_swp_atm[$(4*v_row_no+20)] # successful swaps in 2nd bin sorted by type
+variable    ap5_04 equal f_swp_atm[$(4*v_row_no+21)]
+variable    ap5_05 equal f_swp_atm[$(4*v_row_no+22)]
+variable    ap5_06 equal f_swp_atm[$(4*v_row_no+23)]
+variable    ap5_07 equal f_swp_atm[$(4*v_row_no+24)]
+variable    ap5_08 equal f_swp_atm[$(4*v_row_no+25)]
+variable    ap5_09 equal f_swp_atm[$(4*v_row_no+26)]
+variable    ap5_10 equal f_swp_atm[$(4*v_row_no+27)]
+variable    ap5_11 equal f_swp_atm[$(4*v_row_no+28)]
+variable    ap5_12 equal f_swp_atm[$(4*v_row_no+29)]
+variable    ap5_13 equal f_swp_atm[$(4*v_row_no+30)]
+variable    ap5_14 equal f_swp_atm[$(4*v_row_no+31)]
+
+variable    an6_14 equal f_swp_atm[$(5*v_row_no+3)] # unsuccessful swaps in 2nd bin sorted by type
+variable    an6_13 equal f_swp_atm[$(5*v_row_no+4)]
+variable    an6_12 equal f_swp_atm[$(5*v_row_no+5)]
+variable    an6_11 equal f_swp_atm[$(5*v_row_no+6)]
+variable    an6_10 equal f_swp_atm[$(5*v_row_no+7)]
+variable    an6_09 equal f_swp_atm[$(5*v_row_no+8)]
+variable    an6_08 equal f_swp_atm[$(5*v_row_no+9)]
+variable    an6_07 equal f_swp_atm[$(5*v_row_no+10)]
+variable    an6_06 equal f_swp_atm[$(5*v_row_no+11)]
+variable    an6_05 equal f_swp_atm[$(5*v_row_no+12)]
+variable    an6_04 equal f_swp_atm[$(5*v_row_no+13)]
+variable    an6_03 equal f_swp_atm[$(5*v_row_no+14)]
+variable    ax6_00 equal f_swp_atm[$(5*v_row_no+17)] # no suitable partner found
+variable    ap6_03 equal f_swp_atm[$(5*v_row_no+20)] # successful swaps in 2nd bin sorted by type
+variable    ap6_04 equal f_swp_atm[$(5*v_row_no+21)]
+variable    ap6_05 equal f_swp_atm[$(5*v_row_no+22)]
+variable    ap6_06 equal f_swp_atm[$(5*v_row_no+23)]
+variable    ap6_07 equal f_swp_atm[$(5*v_row_no+24)]
+variable    ap6_08 equal f_swp_atm[$(5*v_row_no+25)]
+variable    ap6_09 equal f_swp_atm[$(5*v_row_no+26)]
+variable    ap6_10 equal f_swp_atm[$(5*v_row_no+27)]
+variable    ap6_11 equal f_swp_atm[$(5*v_row_no+28)]
+variable    ap6_12 equal f_swp_atm[$(5*v_row_no+29)]
+variable    ap6_13 equal f_swp_atm[$(5*v_row_no+30)]
+variable    ap6_14 equal f_swp_atm[$(5*v_row_no+31)]
+
+print     "${indx}, |||, ${sw_att}, ${sw_suc}, |||, ${an1_14}, ${an1_13}, ${an1_12}, ${an1_11}&
+, ${an1_10}, ${an1_09}, ${an1_08}, ${an1_07}, ${an1_06}, ${an1_05}, ${an1_04}, ${an1_03}, |||&
+, ${ax1_00}, |||, ${ap1_03}, ${ap1_04}, ${ap1_05}, ${ap1_06}, ${ap1_07}, ${ap1_08}, ${ap1_09}&
+, ${ap1_10}, ${ap1_11}, ${ap1_12}, ${ap1_13}, ${ap1_14}, |||, ${an2_14}, ${an2_13}, ${an2_12}&
+, ${an2_11}, ${an2_10}, ${an2_09}, ${an2_08}, ${an2_07}, ${an2_06}, ${an2_05}, ${an2_04}&
+, ${an2_03}, |||, ${ax2_00}, |||, ${ap2_03}, ${ap2_04}, ${ap2_05}, ${ap2_06}, ${ap2_07}, ${ap2_08}&
+, ${ap2_09}, ${ap2_10}, ${ap2_11}, ${ap2_12}, ${ap2_13}, ${ap2_14}, |||, ${an3_14}, ${an3_13}&
+, ${an3_12}, ${an3_11}, ${an3_10}, ${an3_09}, ${an3_08}, ${an3_07}, ${an3_06}, ${an3_05}, ${an3_04}&
+, ${an3_03}, |||, ${ax3_00}, |||, ${ap3_03}, ${ap3_04}, ${ap3_05}, ${ap3_06}, ${ap3_07},${ap3_08}&
+, ${ap3_09}, ${ap3_10}, ${ap3_11}, ${ap3_12}, ${ap3_13}, ${ap3_14}, |||, ${an4_14}, ${an4_13}&
+, ${an4_12}, ${an4_11}, ${an4_10}, ${an4_09}, ${an4_08}, ${an4_07}, ${an4_06}, ${an4_05}, ${an4_04}&
+, ${an4_03}, |||, ${ax4_00}, |||, ${ap4_03}, ${ap4_04}, ${ap4_05}, ${ap4_06}, ${ap4_07}, ${ap4_08}&
+, ${ap4_09}, ${ap4_10}, ${ap4_11}, ${ap4_12}, ${ap4_13}, ${ap4_14}, |||, ${an5_14}, ${an5_13}&
+, ${an5_12}, ${an5_11}, ${an5_10}, ${an5_09}, ${an5_08}, ${an5_07}, ${an5_06}, ${an5_05}, ${an5_04}&
+, ${an5_03}, |||, ${ax5_00}, |||, ${ap5_03}, ${ap5_04}, ${ap5_05}, ${ap5_06}, ${ap5_07},${ap5_08}&
+, ${ap5_09}, ${ap5_10}, ${ap5_11}, ${ap5_12}, ${ap5_13}, ${ap5_14}, |||, ${an6_14}, ${an6_13}&
+, ${an6_12}, ${an6_11}, ${an6_10}, ${an6_09}, ${an6_08}, ${an6_07}, ${an6_06}, ${an6_05}, ${an6_04}&
+, ${an6_03}, |||, ${ax6_00}, |||, ${ap6_03}, ${ap6_04}, ${ap6_05}, ${ap6_06}, ${ap6_07},${ap6_08}&
+, ${ap6_09}, ${ap6_10}, ${ap6_11}, ${ap6_12}, ${ap6_13}, ${ap6_14}, |||&
+, ${ndena1}, ${ndenb1}, ${ndenc1}, |||, ${ndena2}, ${ndenb2}, ${ndenc2}, |||&
+, ${ndena3}, ${ndenb3}, ${ndenc3}, |||, ${ndena4}, ${ndenb4}, ${ndenc4}, |||&
+, ${ndena5}, ${ndenb5}, ${ndenc5}, |||, ${ndena6}, ${ndenb6}, ${ndenc6}, |||&
+, ${ndena7}, ${ndenb7}, ${ndenc7}, |||, ${ndena8}, ${ndenb8}, ${ndenc8}, |||&
+, ${vden1}, ${vden2}, ${vden3}, ${vden4}, ${vden5}, ${vden6}, ${vden7}, ${vden8}, |||&
+, " append  ${grow_file} screen no
+
+
+variable    vvden equal $((v_nden03_1*v_va03+v_nden04_1*v_va04+v_nden05_1*v_va05+v_nden06_1*v_va06&
++v_nden07_1*v_va07+v_nden08_1*v_va08+v_nden09_1*v_va09+v_nden10_1*v_va10+v_nden11_1*v_va11&
++v_nden12_1*v_va12+v_nden13_1*v_va13+v_nden14_1*v_va14))/${regvol})
+
+variable    vden1 equal   (${nden03_1}*${va03}+${nden04_1}*${va04}+${nden05_1}*${va05}+${nden06_1}*${va06}+${nden07_1}*${va07}+${nden08_1}*${va08}+${nden09_1}*${va09}+${nden10_1}*${va10}+${nden11_1}*${va11}+${nden12_1}*${va12}+${nden13_1}*${va13}+${nden14_1}*${va14})/${regvol}
+variable    vden2   equal (${nden03_2}*${va03}+${nden04_2}*${va04}+${nden05_2}*${va05}+${nden06_2}*${va06}+${nden07_2}*${va07}+${nden08_2}*${va08}+${nden09_2}*${va09}+${nden10_2}*${va10}+${nden11_2}*${va11}+${nden12_2}*${va12}+${nden13_2}*${va13}+${nden14_2}*${va14})/${regvol}
+variable    vden3   equal (${nden03_3}*${va03}+${nden04_3}*${va04}+${nden05_3}*${va05}+${nden06_3}*${va06}+${nden07_3}*${va07}+${nden08_3}*${va08}+${nden09_3}*${va09}+${nden10_3}*${va10}+${nden11_3}*${va11}+${nden12_3}*${va12}+${nden13_3}*${va13}+${nden14_3}*${va14})/${regvol}
+variable    vden4   equal (${nden03_4}*${va03}+${nden04_4}*${va04}+${nden05_4}*${va05}+${nden06_4}*${va06}+${nden07_4}*${va07}+${nden08_4}*${va08}+${nden09_4}*${va09}+${nden10_4}*${va10}+${nden11_4}*${va11}+${nden12_4}*${va12}+${nden13_4}*${va13}+${nden14_4}*${va14})/${regvol}
+variable    vden5   equal (${nden03_5}*${va03}+${nden04_5}*${va04}+${nden05_5}*${va05}+${nden06_5}*${va06}+${nden07_5}*${va07}+${nden08_5}*${va08}+${nden09_5}*${va09}+${nden10_5}*${va10}+${nden11_5}*${va11}+${nden12_5}*${va12}+${nden13_5}*${va13}+${nden14_5}*${va14})/${regvol}
+variable    vden6   equal (${nden03_6}*${va03}+${nden04_6}*${va04}+${nden05_6}*${va05}+${nden06_6}*${va06}+${nden07_6}*${va07}+${nden08_6}*${va08}+${nden09_6}*${va09}+${nden10_6}*${va10}+${nden11_6}*${va11}+${nden12_6}*${va12}+${nden13_6}*${va13}+${nden14_6}*${va14})/${regvol}
+variable    vden7   equal (${nden03_7}*${va03}+${nden04_7}*${va04}+${nden05_7}*${va05}+${nden06_7}*${va06}+${nden07_7}*${va07}+${nden08_7}*${va08}+${nden09_7}*${va09}+${nden10_7}*${va10}+${nden11_7}*${va11}+${nden12_7}*${va12}+${nden13_7}*${va13}+${nden14_7}*${va14})/${regvol}
+variable    vden8   equal (${nden03_8}*${va03}+${nden04_8}*${va04}+${nden05_8}*${va05}+${nden06_8}*${va06}+${nden07_8}*${va07}+${nden08_8}*${va08}+${nden09_8}*${va09}+${nden10_8}*${va10}+${nden11_8}*${va11}+${nden12_8}*${va12}+${nden13_8}*${va13}+${nden14_8}*${va14})/${regvol}
+
+variable    ap1_03         delete
+variable    ap1_04         delete
+variable    ap1_05         delete
+variable    ap1_06         delete
+variable    ap1_07         delete
+variable    ap1_08         delete
+variable    ap1_09         delete
+variable    ap1_10         delete
+variable    ap1_11         delete
+variable    ap1_12         delete
+variable    ap1_13         delete
+variable    ap1_14         delete
+
+variable    an1_03         delete
+variable    an1_04         delete
+variable    an1_05         delete
+variable    an1_06         delete
+variable    an1_07         delete
+variable    an1_08         delete
+variable    an1_09         delete
+variable    an1_10         delete
+variable    an1_11         delete
+variable    an1_12         delete
+variable    an1_13         delete
+variable    an1_14         delete
+
+variable    ax1_00         delete
+
+variable    ap2_03         delete
+variable    ap2_04         delete
+variable    ap2_05         delete
+variable    ap2_06         delete
+variable    ap2_07         delete
+variable    ap2_08         delete
+variable    ap2_09         delete
+variable    ap2_10         delete
+variable    ap2_11         delete
+variable    ap2_12         delete
+variable    ap2_13         delete
+variable    ap2_14         delete
+
+variable    an2_03         delete
+variable    an2_04         delete
+variable    an2_05         delete
+variable    an2_06         delete
+variable    an2_07         delete
+variable    an2_08         delete
+variable    an2_09         delete
+variable    an2_10         delete
+variable    an2_11         delete
+variable    an2_12         delete
+variable    an2_13         delete
+variable    an2_14         delete
+
+variable    ax2_00         delete
+
+variable    ap3_03         delete
+variable    ap3_04         delete
+variable    ap3_05         delete
+variable    ap3_06         delete
+variable    ap3_07         delete
+variable    ap3_08         delete
+variable    ap3_09         delete
+variable    ap3_10         delete
+variable    ap3_11         delete
+variable    ap3_12         delete
+variable    ap3_13         delete
+variable    ap3_14         delete
+
+variable    an3_03         delete
+variable    an3_04         delete
+variable    an3_05         delete
+variable    an3_06         delete
+variable    an3_07         delete
+variable    an3_08         delete
+variable    an3_09         delete
+variable    an3_10         delete
+variable    an3_11         delete
+variable    an3_12         delete
+variable    an3_13         delete
+variable    an3_14         delete
+
+variable    ax3_00         delete
+
+variable    ap4_03         delete
+variable    ap4_04         delete
+variable    ap4_05         delete
+variable    ap4_06         delete
+variable    ap4_07         delete
+variable    ap4_08         delete
+variable    ap4_09         delete
+variable    ap4_10         delete
+variable    ap4_11         delete
+variable    ap4_12         delete
+variable    ap4_13         delete
+variable    ap4_14         delete
+
+variable    an4_03         delete
+variable    an4_04         delete
+variable    an4_05         delete
+variable    an4_06         delete
+variable    an4_07         delete
+variable    an4_08         delete
+variable    an4_09         delete
+variable    an4_10         delete
+variable    an4_11         delete
+variable    an4_12         delete
+variable    an4_13         delete
+variable    an4_14         delete
+
+variable    ax4_00         delete
+
+variable    ap5_03         delete
+variable    ap5_04         delete
+variable    ap5_05         delete
+variable    ap5_06         delete
+variable    ap5_07         delete
+variable    ap5_08         delete
+variable    ap5_09         delete
+variable    ap5_10         delete
+variable    ap5_11         delete
+variable    ap5_12         delete
+variable    ap5_13         delete
+variable    ap5_14         delete
+
+variable    an5_03         delete
+variable    an5_04         delete
+variable    an5_05         delete
+variable    an5_06         delete
+variable    an5_07         delete
+variable    an5_08         delete
+variable    an5_09         delete
+variable    an5_10         delete
+variable    an5_11         delete
+variable    an5_12         delete
+variable    an5_13         delete
+variable    an5_14         delete
+
+variable    ax5_00         delete
+
+variable    ap6_03         delete
+variable    ap6_04         delete
+variable    ap6_05         delete
+variable    ap6_06         delete
+variable    ap6_07         delete
+variable    ap6_08         delete
+variable    ap6_09         delete
+variable    ap6_10         delete
+variable    ap6_11         delete
+variable    ap6_12         delete
+variable    ap6_13         delete
+variable    ap6_14         delete
+
+variable    an6_03         delete
+variable    an6_04         delete
+variable    an6_05         delete
+variable    an6_06         delete
+variable    an6_07         delete
+variable    an6_08         delete
+variable    an6_09         delete
+variable    an6_10         delete
+variable    an6_11         delete
+variable    an6_12         delete
+variable    an6_13         delete
+variable    an6_14         delete
+
+variable    ax6_00         delete
+
+variable    vden1        delete
+variable    vden2        delete
+variable    vden3        delete
+variable    vden4        delete
+variable    vden5        delete
+variable    vden6        delete
+variable    vden7        delete
+variable    vden8        delete
+
+variable    nden03_1   delete
+variable    nden04_1   delete
+variable    nden05_1   delete
+variable    nden06_1   delete
+variable    nden07_1   delete
+variable    nden08_1   delete
+variable    nden09_1   delete
+variable    nden10_1   delete
+variable    nden11_1   delete
+variable    nden12_1   delete
+variable    nden13_1   delete
+variable    nden14_1   delete
+
+variable    nden03_2   delete
+variable    nden04_2   delete
+variable    nden05_2   delete
+variable    nden06_2   delete
+variable    nden07_2   delete
+variable    nden08_2   delete
+variable    nden09_2   delete
+variable    nden10_2   delete
+variable    nden11_2   delete
+variable    nden12_2   delete
+variable    nden13_2   delete
+variable    nden14_2   delete
+
+variable    nden03_3   delete
+variable    nden04_3   delete
+variable    nden05_3   delete
+variable    nden06_3   delete
+variable    nden07_3   delete
+variable    nden08_3   delete
+variable    nden09_3   delete
+variable    nden10_3   delete
+variable    nden11_3   delete
+variable    nden12_3   delete
+variable    nden13_3   delete
+variable    nden14_3   delete
+
+variable    nden03_4   delete
+variable    nden04_4   delete
+variable    nden05_4   delete
+variable    nden06_4   delete
+variable    nden07_4   delete
+variable    nden08_4   delete
+variable    nden09_4   delete
+variable    nden10_4   delete
+variable    nden11_4   delete
+variable    nden12_4   delete
+variable    nden13_4   delete
+variable    nden14_4   delete
+
+variable    nden03_5   delete
+variable    nden04_5   delete
+variable    nden05_5   delete
+variable    nden06_5   delete
+variable    nden07_5   delete
+variable    nden08_5   delete
+variable    nden09_5   delete
+variable    nden10_5   delete
+variable    nden11_5   delete
+variable    nden12_5   delete
+variable    nden13_5   delete
+variable    nden14_5   delete
+
+variable    nden03_6   delete
+variable    nden04_6   delete
+variable    nden05_6   delete
+variable    nden06_6   delete
+variable    nden07_6   delete
+variable    nden08_6   delete
+variable    nden09_6   delete
+variable    nden10_6   delete
+variable    nden11_6   delete
+variable    nden12_6   delete
+variable    nden13_6   delete
+variable    nden14_6   delete
+
+variable    nden03_7   delete
+variable    nden04_7   delete
+variable    nden05_7   delete
+variable    nden06_7   delete
+variable    nden07_7   delete
+variable    nden08_7   delete
+variable    nden09_7   delete
+variable    nden10_7   delete
+variable    nden11_7   delete
+variable    nden12_7   delete
+variable    nden13_7   delete
+variable    nden14_7   delete
+
+variable    nden03_8   delete
+variable    nden04_8   delete
+variable    nden05_8   delete
+variable    nden06_8   delete
+variable    nden07_8   delete
+variable    nden08_8   delete
+variable    nden09_8   delete
+variable    nden10_8   delete
+variable    nden11_8   delete
+variable    nden12_8   delete
+variable    nden13_8   delete
+variable    nden14_8   delete
+
+variable    ndena1 delete
+variable    ndenb1 delete
+variable    ndenc1 delete
+variable    ndena2 delete
+variable    ndenb2 delete
+variable    ndenc2 delete
+variable    ndena3 delete
+variable    ndenb3 delete
+variable    ndenc3 delete
+variable    ndena4 delete
+variable    ndenb4 delete
+variable    ndenc4 delete
+variable    ndena5 delete
+variable    ndenb5 delete
+variable    ndenc5 delete
+variable    ndena6 delete
+variable    ndenb6 delete
+variable    ndenc6 delete
+variable    ndena7 delete
+variable    ndenb7 delete
+variable    ndenc7 delete
+variable    ndena8 delete
+variable    ndenb8 delete
+variable    ndenc8 delete
+
+unfix       swp_atm
+
+region      equil  delete
+region      den_r1 delete
+region      den_r2 delete
+region      den_r3 delete
+region      den_r4 delete
+region      den_r5 delete
+region      den_r6 delete
+region      den_r7 delete
+region      den_r8 delete
+group       equil  delete
+group       den_r1 delete
+group       den_r2 delete
+group       den_r3 delete
+group       den_r4 delete
+group       den_r5 delete
+group       den_r6 delete
+group       den_r7 delete
+group       den_r8 delete
+
+jump        SELF do_equil
+
+label       no_equil
+
+run         ${swap_cycle_length}
+
+
+label       do_equil
+
+unfix       c_ref   # ceiling reflector has to be moved up
+
+#-- loop back to repeat until film built to specified height
+
+next        indx
+jump        SELF lloop
+label       break
+
+print       "************************"
+print       "Film deposition complete"
+print       "***********************"
+
+write_data ${atom_file} nofix pair ij
+write_restart ${restart_file}
+
+print       "***********************"
+print       "Dump film data complete"
+print       "Write restart file complete"
+print       "***********************"

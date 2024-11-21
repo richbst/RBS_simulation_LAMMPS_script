@@ -1,0 +1,336 @@
+#-- heat film of poly-disperse atoms of 14 types
+#-- one substrate, one deposition (no longer used), twelve sizes of film atoms
+#-- the base is frozen to keep the film from floating up
+#-- layers near the top are linked to make a rigid cap - eliminating free surface
+#-- atoms above the cap are eliminated to reduce mass of the cap
+#-- thermal cycle:
+#-- equilibrate at deposition temp
+#-- cool from deposition temp to start
+#-- create rigid cap
+#-- heat from deposition temp 0.21 to  0.47
+#-- heating/cooling rate 0.015 * 10^-6 per time step
+#-- heat/cool twice to reach equlibrated state
+#-- data output:
+#-- dump atom files during heating to determine mobility and density with separate analysis
+#-- use measured addatom temp rather than thermostated
+
+#-- RB Stephens Dec 2021
+
+#-- define input and output files with unique tag
+#               fc = floating cap, number after gives thickness of frozen layer
+#               b<num> gives bottom position
+variable thermo   index "fc3b8-"
+variable file_pfx index "vvspn120-10"
+variable tempdens_label index "tempdens"
+variable restart_label  index "restart"
+variable atom_end       index "data"
+variable start_end      index ".film"
+variable char_end       index "dump"
+variable text_end       index ".txt"
+variable film_end       index ".film"
+variable imag_end       index ".jpg"
+variable tempdens_file  index ${thermo}${file_pfx}${tempdens_label}${text_end}
+variable atom_file      index ${file_pfx}${atom_end}${film_end}
+variable restart_file   index ${file_pfx}${restart_label}${film_end}
+variable char_file      index ${thermo}${file_pfx}${char_end}${film_end}
+variable stepdenscode   index "steptempdens,"
+variable stepdenshdr    index ${stepdenscode}${file_pfx}
+
+#-- deposition temp
+variable   dep_temp equal 0.120
+variable   film_top equal 36.  # <<<< better to get the value from restart file data - how??
+
+#-- set min and max ramp temp
+variable   init_temp equal 0.21
+variable   top_temp  equal 0.47
+variable   temp_damp equal 1.0     # damps in 200*temp_damp time steps
+
+#-- set cap thickness and position
+variable   tthick    equal 3.0 #
+variable   tbot      equal 8.0 # location of the bottom of the cap
+
+#-- define system
+variable    width  equal 10
+variable    height equal 40
+
+#-- addatoms
+variable    d_width equal 0.25 # fractional width of dia and e distributions
+variable    max_dia equal 1.2
+variable    del_dia equal ${d_width}*${max_dia}/11.0
+variable    max_vol equal ${max_dia}*${max_dia}*${max_dia}/6.28
+variable    min_vol equal $(v_max_dia-v_del_dia)*$(v_max_dia-v_del_dia)*$(v_max_dia-v_del_dia)/6.28
+variable    vol_cor equal 1.4142
+variable    avg_vol equal (${max_vol}+${min_vol})/2.0
+variable    cutoff  equal ${max_dia}*2.5
+variable    max_e   equal 1.0
+variable    del_e   equal ${d_width}*${max_e}
+variable    n_typ   equal 14    # number of steps in distribution + 1 for substrate + 1 for deposit type
+
+#-- substrate atoms
+variable    sub_dia equal 10.0/12.0*(${max_dia}-${del_dia})
+variable    sub_e   equal 10.0
+
+#-- wall potential
+variable    bot_dia equal 0.75
+variable    bot_e   equal 10.0
+
+#-- set intervals for initial and final hold and for temp ramp
+variable cycle_scale equal 1000000
+variable cycle_hld equal 0.5*${cycle_scale}
+variable ramp_rate equal 65.0 #-- per million time steps
+variable cycle_rmp equal floor(${ramp_rate}*(${top_temp}-${init_temp})*${cycle_scale}+0.5)
+variable init_rmp equal abs(floor(${ramp_rate}*(${dep_temp}-${init_temp})*${cycle_scale}+0.5))
+
+#-- substrate boundaries
+variable    sub_top equal 2.0*${sub_dia}+0.01
+variable    sub_bot equal 0.01
+
+#-- dens measuring boundaries
+variable    mob_bot equal 10.0             # define density meas region
+variable    mob_mid equal 17.5             # split in two to check temperature uniformity
+variable    mob_top equal 25.0
+
+#-- output data during thermocycle
+variable char_freq equal floor(${cycle_scale}/20.0+0.5)
+
+#-- want averaged temperature and density values for a cycle_scale
+#--(initial equilibration is 0.5x and ramp is 65x)
+#-- each averaged over 10000  values, each spaced by 1 step
+
+variable therm_repeat equal  ${char_freq}        # no of observ. averaged for each value
+variable therm_every equal 1           # spacing between observations
+
+#-- define particles
+units           lj  # units dimensionless, timestep 0.005 tau_red
+                    # where tau_red = tau * sqrt(e/(m sigma^2))
+                    # for Si atoms, timestep(sec) = 0.005*1.27x10^-12 = 6 fs
+atom_style      atomic
+pair_style      lj/cut ${cutoff}
+boundary        p p f
+
+#-- input preconstructed film - this includes group definitions and lj floor to keep atoms pinned down, but not regions, variables, computes, or fix commands
+read_restart    ${restart_file}
+
+#-- start timestep at 0
+reset_timestep 0
+
+#-- add an lj floor
+fix             wall_blj  all wall/lj126 zlo EDGE ${bot_e} ${bot_dia} ${cutoff} units box
+
+neigh_modify    delay 2 check yes
+
+#-- define regions and groups
+#   volumes for averaging film properties
+region          mobile block  0.0 ${width} 0.0 ${width} ${mob_bot} ${mob_top} side in units box
+region          mob_top block 0.0 ${width} 0.0 ${width} ${mob_mid} ${mob_top} side in units box
+region          mob_bot block 0.0 ${width} 0.0 ${width} ${mob_bot} ${mob_mid} side in units box
+#   volumes for substrate
+region          subst block 0.0 ${width} 0.0 ${width} ${sub_bot} ${sub_top} side in units box
+#   volumes for regions in addatoms - floating cap, underneath, and above
+region          fcap    block 0.0 ${width} 0.0 ${width} $(v_film_top-v_tbot) $(v_film_top-v_tbot+v_tthick) side in units box
+region          ftop    block 0.0 ${width} 0.0 ${width} $(v_film_top-v_tbot+v_tthick) ${height} side in units box
+
+#-- define substrate and add_atom groups
+group           subatom     type 1
+group           addatoms    subtract all subatom
+group           fcap        region fcap
+group           ftop        region ftop
+group           undatm      subtract addatoms ftop fcap subatom
+
+#-- eliminate atoms above the cap
+variable ftop_no equal count(ftop)
+print "Eliminating ${ftop_no} atoms from above the floating cap"
+delete_atoms    group ftop
+
+#-- define groups for density calculation
+group    at02         type 2
+group    at03         type 3
+group    at04         type 4
+group    at05         type 5
+group    at06         type 6
+group    at07         type 7
+group    at08         type 8
+group    at09         type 9
+group    at10         type 10
+group    at11         type 11
+group    at12         type 12
+group    at13         type 13
+group    at14         type 14
+
+#-- calculate temp and density of addatoms group
+compute         Tmob addatoms temp/region mobile
+compute         Ttop addatoms temp/region mob_top
+compute         Tbot addatoms temp/region mob_bot
+variable        add_no equal count(addatoms)
+variable        und_no equal count(undatm)
+variable        sub_no equal count(subatom)
+variable        cap_no equal count(fcap)
+print "add atoms = ${add_no}, under atoms = ${und_no}, cap atoms = ${cap_no}, sub atoms = ${sub_no}"
+variable  ct02 equal count(at02,mobile)
+variable  ct03 equal count(at03,mobile)
+variable  ct04 equal count(at04,mobile)
+variable  ct05 equal count(at05,mobile)
+variable  ct06 equal count(at06,mobile)
+variable  ct07 equal count(at07,mobile)
+variable  ct08 equal count(at08,mobile)
+variable  ct09 equal count(at09,mobile)
+variable  ct10 equal count(at10,mobile)
+variable  ct11 equal count(at11,mobile)
+variable  ct12 equal count(at12,mobile)
+variable  ct13 equal count(at13,mobile)
+variable  ct14 equal count(at14,mobile)
+variable  dia02   equal ${max_dia}
+variable  dia03   equal ${max_dia}
+variable  dia04   equal ${max_dia}-1.0*${del_dia}
+variable  dia05   equal ${max_dia}-2.0*${del_dia}
+variable  dia06   equal ${max_dia}-3.0*${del_dia}
+variable  dia07   equal ${max_dia}-4.0*${del_dia}
+variable  dia08   equal ${max_dia}-5.0*${del_dia}
+variable  dia09   equal ${max_dia}-6.0*${del_dia}
+variable  dia10   equal ${max_dia}-7.0*${del_dia}
+variable  dia11   equal ${max_dia}-8.0*${del_dia}
+variable  dia12   equal ${max_dia}-9.0*${del_dia}
+variable  dia13   equal ${max_dia}-10.0*${del_dia}
+variable  dia14   equal ${max_dia}-11.0*${del_dia}
+variable  va02    equal 3.14159/6.0*${dia02}*${dia02}*${dia02}*${vol_cor}
+variable  va03    equal 3.14159/6.0*${dia03}*${dia03}*${dia03}*${vol_cor}
+variable  va04    equal 3.14159/6.0*${dia04}*${dia04}*${dia04}*${vol_cor}
+variable  va05    equal 3.14159/6.0*${dia05}*${dia05}*${dia05}*${vol_cor}
+variable  va06    equal 3.14159/6.0*${dia06}*${dia06}*${dia06}*${vol_cor}
+variable  va07    equal 3.14159/6.0*${dia07}*${dia07}*${dia07}*${vol_cor}
+variable  va08    equal 3.14159/6.0*${dia08}*${dia08}*${dia08}*${vol_cor}
+variable  va09    equal 3.14159/6.0*${dia09}*${dia09}*${dia09}*${vol_cor}
+variable  va10    equal 3.14159/6.0*${dia10}*${dia10}*${dia10}*${vol_cor}
+variable  va11    equal 3.14159/6.0*${dia11}*${dia11}*${dia11}*${vol_cor}
+variable  va12    equal 3.14159/6.0*${dia12}*${dia12}*${dia12}*${vol_cor}
+variable  va13    equal 3.14159/6.0*${dia13}*${dia13}*${dia13}*${vol_cor}
+variable  va14    equal 3.14159/6.0*${dia14}*${dia14}*${dia14}*${vol_cor}
+variable        reg_vol equal ${width}*${width}*(${mob_top}-${mob_bot})
+print    "<><><><><><><><><><><><><><><>"
+print   "Type parameters and initial mix in the mobility region:"
+print    "dia/vol/count(02) = $(v_dia02:%.2f) / $(v_va02:%.3f) / $(v_ct02)"
+print    "dia/vol/count(03) = $(v_dia03:%.2f) / $(v_va03:%.3f) / $(v_ct03)"
+print    "dia/vol/count(04) = $(v_dia04:%.2f) / $(v_va04:%.3f) / $(v_ct04)"
+print    "dia/vol/count(05) = $(v_dia05:%.2f) / $(v_va05:%.3f) / $(v_ct05)"
+print    "dia/vol/count(06) = $(v_dia06:%.2f) / $(v_va06:%.3f) / $(v_ct06)"
+print    "dia/vol/count(07) = $(v_dia07:%.2f) / $(v_va07:%.3f) / $(v_ct07)"
+print    "dia/vol/count(08) = $(v_dia08:%.2f) / $(v_va08:%.3f) / $(v_ct08)"
+print    "dia/vol/count(09) = $(v_dia09:%.2f) / $(v_va09:%.3f) / $(v_ct09)"
+print    "dia/vol/count(10) = $(v_dia10:%.2f) / $(v_va10:%.3f) / $(v_ct10)"
+print    "dia/vol/count(11) = $(v_dia11:%.2f) / $(v_va11:%.3f) / $(v_ct11)"
+print    "dia/vol/count(12) = $(v_dia12:%.2f) / $(v_va12:%.3f) / $(v_ct12)"
+print    "dia/vol/count(13) = $(v_dia13:%.2f) / $(v_va13:%.3f) / $(v_ct13)"
+print    "dia/vol/count(14) = $(v_dia14:%.2f) / $(v_va14:%.3f) / $(v_ct14)"
+print    "region_vol = ${reg_vol}"
+print    "<><><><><><><><><><><><><><><>"
+
+
+variable        atm_dens equal (v_ct02*v_va02+v_ct03*v_va03+v_ct04*v_va04+v_ct05*v_va05+v_ct06*v_va06+v_ct07*v_va07+v_ct08*v_va08+v_ct09*v_va09+v_ct10*v_va10+v_ct11*v_va11+v_ct12*v_va12+v_ct13*v_va13+v_ct14*v_va14)/v_reg_vol
+variable        atm_temp equal temp
+
+#-- dump jpegs of heating film <<<<<<< can't be used on Phasma
+# dump            1 all image ${char_freq} img.*.jpg type type zoom 1.6 adiam 1.0 view 90 30
+
+#-- create images of film using per-atom data
+dump            13  all      custom ${char_freq} ${char_file} id type xs ys zs
+
+#-- output temp and density of addatoms to terminal
+thermo_style    custom step atoms temp v_atm_dens c_Tmob c_Ttop c_Tbot
+thermo          ${char_freq}                                 # print to terminal
+thermo_modify   lost ignore                          # don't worry about lost atoms
+
+#-- record temp and density of addatoms in file
+#-- print film info: temp, thickness, and density to files- use averaged numbers
+fix             4 addatoms ave/time ${therm_every} ${therm_repeat} ${char_freq} v_atm_temp v_atm_dens v_add_no c_Tmob c_Ttop c_Tbot  title1 ${stepdenshdr} title2 "Step Temp Dens AtomNo Temp_mob Temp_top Temp_bot" ave one file ${tempdens_file}
+
+#-- remove lateral drift
+fix             drift all momentum 1 linear 1 1 0
+
+#-- equilibrate at deposition temp
+print           "*********************************"
+print           "Starting equilibrate at ${dep_temp}"
+print           "*********************************"
+fix             3  addatoms nvt temp ${dep_temp} ${dep_temp} ${temp_damp}
+fix             31 subatom  rigid/nvt group 1 subatom temp ${dep_temp} ${dep_temp} ${temp_damp}
+
+run             ${cycle_hld} # to settle film at start of temp ramps
+
+#-- cool to starting temp
+print           "*********************************"
+print           "Starting cool to ${init_temp}"
+print           "*********************************"
+fix             3  addatoms nvt temp ${dep_temp} ${init_temp} ${temp_damp}
+fix             31 subatom  rigid/nvt group 1 subatom temp ${dep_temp} ${init_temp} ${temp_damp}
+
+run             ${init_rmp} # to cool to start of heating cycle
+#-- heat to max temp
+print           "*********************************"
+print           "Starting heat ramp #1 from ${init_temp} to ${top_temp}"
+print           "*********************************"
+
+fix             3  undatm  nvt                       temp ${init_temp} ${top_temp} ${temp_damp}
+fix             31 subatom rigid/nvt group 1 subatom temp ${init_temp} ${top_temp} ${temp_damp}
+fix             32 fcap    rigid/nvt group 1 fcap    temp ${init_temp} ${top_temp} ${temp_damp}
+
+run             ${cycle_rmp}
+
+#-- hold at max temp
+print           "*********************************"
+print           "Heat soak #1 at ${top_temp}"
+print           "*********************************"
+
+fix             3  undatm  nvt                       temp ${top_temp} ${top_temp} ${temp_damp}
+fix             31 subatom rigid/nvt group 1 subatom temp ${top_temp} ${top_temp} ${temp_damp}
+fix             32 fcap    rigid/nvt group 1 fcap    temp ${top_temp} ${top_temp} ${temp_damp}
+
+run             ${cycle_hld}
+
+#-- cool to min temp
+print           "*********************************"
+print           "Starting cooling #1 ramp from ${top_temp} to ${init_temp}"
+print           "*********************************"
+
+fix             3  undatm  nvt                       temp ${top_temp} ${init_temp} ${temp_damp}
+fix             31 subatom rigid/nvt group 1 subatom temp ${top_temp} ${init_temp} ${temp_damp}
+fix             32 fcap    rigid/nvt group 1 fcap    temp ${top_temp} ${init_temp} ${temp_damp}
+
+run             ${cycle_rmp}
+
+#-- heat to max temp
+print           "*********************************"
+print           "Starting heat ramp #2 from ${init_temp} to ${top_temp}"
+print           "*********************************"
+
+fix             3  undatm  nvt                       temp ${init_temp} ${top_temp} ${temp_damp}
+fix             31 subatom rigid/nvt group 1 subatom temp ${init_temp} ${top_temp} ${temp_damp}
+fix             32 fcap    rigid/nvt group 1 fcap    temp ${init_temp} ${top_temp} ${temp_damp}
+
+run             ${cycle_rmp}
+
+#-- hold at max temp
+print           "*********************************"
+print           "Heat soak #2 at ${top_temp}"
+print           "*********************************"
+
+fix             3  undatm  nvt                       temp ${top_temp} ${top_temp} ${temp_damp}
+fix             31 subatom rigid/nvt group 1 subatom temp ${top_temp} ${top_temp} ${temp_damp}
+fix             32 fcap    rigid/nvt group 1 fcap    temp ${top_temp} ${top_temp} ${temp_damp}
+
+run             ${cycle_hld}
+
+#-- cool to min temp
+print           "*********************************"
+print           "Starting cooling #2 ramp from ${top_temp} to ${init_temp}"
+print           "*********************************"
+
+fix             3  undatm  nvt                       temp ${top_temp} ${init_temp} ${temp_damp}
+fix             31 subatom rigid/nvt group 1 subatom temp ${top_temp} ${init_temp} ${temp_damp}
+fix             32 fcap    rigid/nvt group 1 fcap    temp ${top_temp} ${init_temp} ${temp_damp}
+
+run             ${cycle_rmp}
+
+
+#-- stop at min temp
+print           "*********************************"
+print           "Cooled to ${init_temp} - heat cycle complete"
+print           "*********************************"
