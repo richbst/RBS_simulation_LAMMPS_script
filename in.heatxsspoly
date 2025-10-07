@@ -20,7 +20,7 @@
 #               fc = floating cap, number after gives thickness of frozen layer
 #               b<num> gives bottom position
 variable thermo   index "fc3b8-"
-variable file_pfx index "vvspn120-10"
+variable file_pfx index "vvspn120-11"
 variable tempdens_label index "tempdens"
 variable restart_label  index "restart"
 variable atom_end       index "data"
